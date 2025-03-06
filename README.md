@@ -10,7 +10,14 @@ This guide configures a Pirate Audio screen (ST7789-based) to display AirPlay tr
   ```bash
   sudo raspi-config
   # Navigate to Interface Options > SPI > Enable > Reboot
-  
+## Notes
+- Replace [yourpiuser] with your username.
+
+- st7789 requires pip due to Bookworm’s restrictions—apt won’t work.
+
+
+
+
 # Installation Steps
 
 1. Update the system
@@ -63,8 +70,59 @@ st7789      1.0.1
    python ~/pirate-audio/display.py &
 
 
+# Run on boot
+
+1. Create startup script
+   ```bash
+   nano ~/pirate-audio/run.sh
+   ```
+   ```bash
+   #!/bin/bash
+   sudo pkill -f "python.*display.py" 2>/dev/null
+   source /home/[yourpiuser]/pirate-audio/venv/bin/activate
+   exec sudo /home/[yourpiuser]/pirate-audio/venv/bin/python /home/[yourpiuser]/pirate-audio/display.py >> /home/[yourpiuser]/display.log 2>&1
+  ```
+  chmod +x ~/pirate-audio/run.sh
+  ```
+2. Set up Systemd Service
+   ```bash
+   sudo nano /etc/systemd/system/pirate-audio.service
+   ```
+   ```
+   [Unit]
+   Description=Pirate Audio Display Service
+   After=network.target shairport-sync.service
+   Wants=shairport-sync.service
+
+   [Service]
+   Type=simple
+   ExecStart=/bin/bash /home/[yourpiuser]/pirate-audio/run.sh
+   WorkingDirectory=/home/[yourpiuser]/pirate-audio
+   StandardOutput=file:/home/[yourpiuser]/display.log
+   StandardError=file:/home/[yourpiuser]/display.log
+   Restart=on-failure
+   RestartSec=10
+   User=[youruser]
+   Group=[youruser]
+   ExecStartPre=/bin/sleep 15
+
+   [Install]
+   WantedBy=multi-user.target
+
+  Enable and start:
+  ```bash
+  sudo systemctl daemon-reload
+  sudo systemctl enable pirate-audio.service
+  sudo systemctl start pirate-audio.service
+  ```
+3. Reboot and verify
+   ```bash
+   sudo rebot
+
+4.
 
 # Troubleshooting
+I'll fill this out as issues arrise and post the solutions
 
 - **FileNotFoundError for spidev**:
   ```bash
