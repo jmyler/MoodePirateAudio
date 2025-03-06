@@ -100,18 +100,15 @@ while True:
         current_time = time.time()
 
         # Get playback info
-        if os.path.exists(METADATA_PIPE):
-            state, track, artist, artwork = get_airplay_info()
-        else:
-            state, track, artist, artwork = get_mpd_info()
+        state, track, artist, artwork = get_airplay_info()
 
-        logging.debug(f"State: {state}, Track: {track}, Artist: {artist}")
+        logging.debug(f"State: {state}, Track: {track}, Artist: {artist}, Artwork: {bool(artwork)}")
 
         # Check for idle state
         is_idle = (state == "stopped" or (track == "Unknown" and artist == "Unknown"))
 
         # Detect song change
-        if not is_idle and (track != previous_track or artist != previous_artist or artwork != previous_artwork):
+        if not is_idle and (track != previous_track or artist != previous_artist):
             logging.debug(f"Song change detected: {track} by {artist}")
             previous_track = track
             previous_artist = artist
@@ -126,17 +123,22 @@ while True:
             if current_display_mode != "idle":
                 display.display(draw_screensaver())
                 current_display_mode = "idle"
-                logging.debug("Switched to screensaver")
-        elif artwork:
+                logging.debug("Switched to screensaver due to idle state")
+        elif artwork or current_display_mode == "text_and_art":
             # Check if we should switch to full-screen art
             if current_display_mode == "text_and_art" and (current_time - last_song_change_time) >= show_text_duration:
-                display.display(artwork)
-                current_display_mode = "full_art"
-                logging.debug("Switched to full-screen art")
+                if artwork:
+                    display.display(artwork)
+                    current_display_mode = "full_art"
+                    logging.debug("Switched to full-screen art")
+                else:
+                    current_display_mode = "text_and_art"
+                    logging.debug("Maintaining text and art due to lack of artwork")
             elif current_display_mode != "full_art":
                 # Show text + art
                 img = Image.new("RGB", (240, 240), "BLACK")
-                img.paste(artwork, (0, 0))
+                if artwork:
+                    img.paste(artwork, (0, 0))
                 draw = ImageDraw.Draw(img)
                 
                 # Check if the track name is too long and needs scrolling
@@ -155,13 +157,12 @@ while True:
                 current_display_mode = "text_and_art"
                 logging.debug("Switched to text and art")
         else:
-            # No artwork - revert to screensaver
+            # No artwork and not in text and art mode - revert to screensaver
             if current_display_mode != "idle":
                 display.display(draw_screensaver())
                 current_display_mode = "idle"
-                logging.debug("No artwork available, switched to screensaver")
+                logging.debug("No artwork and not in text and art mode, switched to screensaver")
 
         time.sleep(0.1)
     except Exception as e:
         logging.exception("Exception occurred in main loop")
-
