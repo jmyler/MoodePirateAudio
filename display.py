@@ -1,4 +1,4 @@
-                                                                                                                   #!/usr/bin/env python3
+#!/usr/bin/env python3
 from st7789 import ST7789
 from PIL import Image, ImageDraw, ImageFont
 import mpd
