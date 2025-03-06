@@ -64,3 +64,9 @@ st7789      1.0.1
 
 
 
+# Troubleshooting
+
+- **FileNotFoundError for spidev**:
+  ```bash
+  sudo raspi-config
+  # Interface Options > SPI > Enable > Reboot
