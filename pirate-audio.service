@@ -1,0 +1,16 @@
+[Unit]
+Description=Pirate Audio display + battery monitor
+After=network.target bluetooth.target mpd.service
+
+[Service]
+Type=simple
+User=__USER__
+SupplementaryGroups=spi i2c gpio
+WorkingDirectory=__DIR__
+ExecStart=__DIR__/venv/bin/python __DIR__/display.py
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

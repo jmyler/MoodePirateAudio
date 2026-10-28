@@ -1,130 +1,121 @@
-# Pirate Audio with Moode Audio
+# Pirate Audio + moOde: now playing, battery & connection control
 
-This guide configures a Pirate Audio screen (ST7789-based) to display AirPlay track information (title, artist, album art) on a fresh Moode Audio 9.1.5 install running on a Raspberry Pi Zero 2 W. These steps start from a fresh install and resolve dependency and stability issues encountered along the way.
+A small screen for a moOde-based portable speaker. It shows what's playing
+and who's connected, tracks a LiFePO4 battery, and lets you manage
+who's connected with buttons on the box.
 
-## Prerequisites
+Built for a Raspberry Pi running **moOde 10.x (Trixie, 64-bit)** with a
+Pimoroni **Pirate Audio Line-Out** (ST7789 240×240 screen, 4 buttons,
+PCM5100A DAC). Any ST7789 SPI screen and I2S DAC should work with small
+config changes.
 
-- Fresh Moode Audio 9.1.5 installed via Raspberry Pi Imager.
-- SSH enabled (`ssh pi@moode.local`, default password: `moodeaudio`).
-- SPI interface enabled:
-  ```bash
-  sudo raspi-config
-  # Navigate to Interface Options > SPI > Enable > Reboot
-## Notes
-- Replace [yourpiuser] with your username.
+## Features
 
-- st7789 requires pip due to Bookworm’s restrictions—apt won’t work.
+- **Now playing for any moOde source.** It follows moOde's own
+  active-renderer flags:
+  - **AirPlay:** title, artist and cover art from moOde's
+    `/var/local/www/aplmeta.json`. The script never reads the shairport
+    metadata pipe, because moOde already reads it and two readers on one
+    pipe each get random pieces of the data. That was the cause of the old
+    "AirPlay is flaky" problem.
+  - **Bluetooth:** the connected phone's name, plus title and artist over
+    AVRCP, read through BlueZ.
+  - **Spotify / other renderers:** shows the source label.
+  - **Library / radio / UPnP:** from MPD, with embedded cover art.
+- **Who's connected:** a full-screen "Connected: Maddux's iPhone" splash
+  when a phone connects, and a matching one on disconnect.
+- **Shared-speaker controls:**
+  - **Hold A (2 s) to kick.** Disconnects the current Bluetooth phone and
+    blocks it for 5 minutes so it can't grab the speaker right back. Also
+    drops an active AirPlay sender. Blocks are saved to a file and lifted on
+    restart, so nobody stays blocked by accident.
+  - **Hold B (2 s) for pairing mode.** The speaker is discoverable for
+    2 minutes, and the screen shows a countdown and the name to look for.
+    Otherwise it stays hidden from new devices; phones that have already
+    paired can still connect.
+- **Battery (INA226 coulomb counter):** percentage, runtime left,
+  voltage/current/power and peak current. It syncs to 100% on a full
+  charge and keeps its count across restarts.
+- **Short presses:** A = screen on/off, B = now playing ↔ battery detail,
+  X/Y = volume.
 
+## Files
 
+| File | Purpose |
+|---|---|
+| `display.py` | Main program: rendering, buttons, battery thread |
+| `sources.py` | Works out what moOde is playing and gets the metadata |
+| `btctl.py` | Bluetooth kick/block, pairing mode, AirPlay drop |
+| `st7789_lite.py` | Minimal ST7789 driver (spidev + lgpio); avoids `gpiodevice` |
+| `ina226.py` | INA226 driver and LiFePO4 battery gauge |
+| `ina_test.py` | Bench test for the INA226 |
+| `setup.sh` | One-time install (packages, venv, SPI fix, service) |
+| `pirate-audio.service` | systemd unit template (filled in by `setup.sh`) |
+| `legacy/` | The original scripts, kept for reference |
 
+## Install
 
-# Installation Steps
-
-1. Update the system
+1. Flash **moOde 10.x** with Raspberry Pi Imager. In Edit Settings, set
+   the hostname, user/password, Wi-Fi (2.4 GHz for a Zero 2 W) and
+   **enable SSH**.
+2. In the moOde web UI:
+   - **Configure → Audio → Named I2S device:** **HiFiBerry DAC** for the
+     Pirate Audio (or **Raspberry Pi DAC+** for that board).
+   - **Configure → Renderers:** turn on **AirPlay** and **Bluetooth**.
+3. On the Pi:
    ```bash
-   sudo apt update && sudo apt upgrade -y
-
-2. Install Base Python Dependencies
-   ```bash
-   sudo apt install python3-pip python3-pil python3-mpd -y
-Installs pip3 for Python package management, python3-pil (Pillow) for image processing, and python3-mpd (python-mpd2) for MPD client support globally.
-
-3. Create virtual environemnt
-   ```bash
-   python3 -m venv ~/pirate-audio/venv
-   source ~/pirate-audio/venv/bin/activate
-   pip install --upgrade pip
-  Creates an isolated Python environment to avoid "externally managed environment" error in Raspberry Pi OS Bookworm.
-
- 4. Install Required Python Libraries in the Virtual Environment
-     ```bash
-     pip install st7789 Pillow python-mpd2
-  Installs:
-st7789 (1.0.1) for the Pirate Audio display driver.
-
-Pillow (11.1.0) for image handling.
-
-python-mpd2 (3.1.1) for MPD communication.
-
-5. Verify the installation
-   ```bash
-   pip list | grep -i -E "st7789|pillow|python-mpd"
-You should should see the three libraries installed
-Pillow      11.1.0
-python-mpd2 3.1.1
-st7789      1.0.1
-
-6. Deploy the Display Script
-   Create and populate display.py with the following script to read AirPlay metadata and update the screen:
-   ```bash
-   nano ~/pirate-audio/display.py
-  Place the contents of display.py file in the repo here
-  Exit and save
-
-7. Save and make executable
-   ```bash
-   chmod +x ~/pirate-audio/display.py
-
-8. Start
-   ```bash
-   python ~/pirate-audio/display.py &
-
-
-# Run on boot
-
-1. Create startup script
-   ```bash
-   nano ~/pirate-audio/run.sh
+   git clone https://github.com/jmyler/MoodePirateAudio ~/pirate-audio
+   cd ~/pirate-audio && ./setup.sh && sudo reboot
    ```
+4. Test by hand, then enable at boot:
    ```bash
-   #!/bin/bash
-   sudo pkill -f "python.*display.py" 2>/dev/null
-   source /home/[yourpiuser]/pirate-audio/venv/bin/activate
-   exec sudo /home/[yourpiuser]/pirate-audio/venv/bin/python /home/[yourpiuser]/pirate-audio/display.py >> /home/[yourpiuser]/display.log 2>&1
-  ```
-  chmod +x ~/pirate-audio/run.sh
-  ```
-2. Set up Systemd Service
-   ```bash
-   sudo nano /etc/systemd/system/pirate-audio.service
+   cd ~/pirate-audio && venv/bin/python display.py
+   sudo systemctl enable --now pirate-audio
+   journalctl -u pirate-audio -f
    ```
-   ```
-   [Unit]
-   Description=Pirate Audio Display Service
-   After=network.target shairport-sync.service
-   Wants=shairport-sync.service
 
-   [Service]
-   Type=simple
-   ExecStart=/bin/bash /home/[yourpiuser]/pirate-audio/run.sh
-   WorkingDirectory=/home/[yourpiuser]/pirate-audio
-   StandardOutput=file:/home/[yourpiuser]/display.log
-   StandardError=file:/home/[yourpiuser]/display.log
-   Restart=on-failure
-   RestartSec=10
-   User=[youruser]
-   Group=[youruser]
-   ExecStartPre=/bin/sleep 15
+Kick and pairing mode run `bluetoothctl` through `sudo -n`. The user that
+Imager creates has passwordless sudo by default. Check with
+`sudo -n true && echo ok`.
 
-   [Install]
-   WantedBy=multi-user.target
+## Configuration
 
-  Enable and start:
-  ```bash
-  sudo systemctl daemon-reload
-  sudo systemctl enable pirate-audio.service
-  sudo systemctl start pirate-audio.service
-  ```
-3. Reboot and verify
-   ```bash
-   sudo rebot
+Settings are at the top of `display.py`:
 
-4.
+- `CAPACITY_AH`, `CELLS`: battery pack (default 8S, 25.6 V LiFePO4)
+- `SHUNT_OHMS`, `CURRENT_GAIN`, `CURRENT_SIGN`: INA226 shunt calibration
+- `BUTTONS`: GPIO pins (Pirate Audio: A=5, B=6, X=16, Y=24)
+- `HIDE_BY_DEFAULT`: set to `False` to stay discoverable all the time
+- `PAIR_S`, `LONG_PRESS_S`, `PAIR_HINT`
+- `btctl.HOLD_S`: how long a kicked phone stays blocked
 
-# Troubleshooting
-I'll fill this out as issues arrise and post the solutions
+Optional: put a 240×240 `jm_logo.jpeg` next to `display.py` to use as the
+idle screen.
 
-- **FileNotFoundError for spidev**:
-  ```bash
-  sudo raspi-config
-  # Interface Options > SPI > Enable > Reboot
+## Wiring the INA226
+
+| INA226 | Pi (physical pin) |
+|---|---|
+| VCC | 3.3 V (1) |
+| GND | GND (6), also tied to battery − |
+| SDA | GPIO 2 (3) |
+| SCL | GPIO 3 (5) |
+| IN+ / IN− | inline with battery + (high side) |
+| VBUS | battery + |
+
+`i2cdetect -y 1` should show the INA226 at **0x40**. Run
+`venv/bin/python ina_test.py` to check the readings.
+
+## Gotchas this fixes
+
+- **"Invalid argument" claiming GPIO 9:** on newer kernels the SPI driver
+  owns MISO (GPIO 9), which the Pirate Audio uses for the screen's DC line.
+  `setup.sh` replaces `dtparam=spi=on` with `dtoverlay=spi0-2cs,no_miso`.
+  moOde can rewrite `config.txt` when you change audio settings, so if the
+  screen stops working, check that this line is still there.
+- **Pimoroni's `st7789` / `gpiodevice` failing on Trixie:** this project
+  uses its own small driver (`st7789_lite.py`) instead.
+- **AirPlay metadata missing or random:** read moOde's `aplmeta.json`,
+  not the pipe.
+- **SD card verify failures in Imager:** try a different card reader
+  before blaming the card.
