@@ -22,7 +22,7 @@ LOGO = os.path.join(HOME, "jm_logo.jpeg")          # optional idle image
 STATE_FILE = os.path.join(HOME, "battery_state.json")
 
 BATTERY_ENABLED = True
-CAPACITY_AH = 20.0        # <-- set to your Battery Hookup pack's capacity
+CAPACITY_AH = 6.0         # <-- set to your Battery Hookup pack's capacity
 CELLS = 8                 # 25.6 V LiFePO4 = 8S
 SHUNT_OHMS = 0.002        # R002
 CURRENT_GAIN = 1.0        # trim against a clamp meter
@@ -284,12 +284,18 @@ def _render_main(img, d, src, playing, title, artist, art, b, view, device, inpu
                 ("Avg draw", f"{b['avg']:.2f} A"),
                 ("Peak", f"{b['peak']:.1f} A"),
                 ("Runtime", fmt_hrs(b["hrs"]) or "--")]
+        if LANDSCAPE:   # big % on the left, stats in a column on the right
+            d.rectangle((0, 36, W, 110), fill=(0, 0, 0))                         # clear the centred %
+            d.text((80, 128), pct, font=F_XL, fill=batt_color(b), anchor="mm")
+            x0, x1, y0, step = 160, W - 12, 52, 27
+        else:
+            x0, x1, y0, step = 14, W - 14, 118, 19
         for n, (k, v) in enumerate(rows):
-            y = 110 + n * 21
-            d.text((14, y), k, font=F_SM, fill=(160, 160, 160))
-            d.text((W - 14 - d.textlength(v, font=F_MD), y - 2), v, font=F_MD, fill="white")
+            y = y0 + n * step                                                    # row centre line
+            d.text((x0, y), k, font=F_SM, fill=(160, 160, 160), anchor="lm")
+            d.text((x1, y), v, font=F_MD, fill="white", anchor="rm")
         if not b["synced"]:
-            d.text((14, H - 16), "~ estimate until first full charge", font=font(11), fill=(130, 130, 130))
+            d.text((W / 2, H - 9), "~ estimate until first full charge", font=font(11), fill=(130, 130, 130), anchor="mm")
         return img
 
     if not src:   # idle
@@ -484,9 +490,17 @@ def main():
     buttons = setup_buttons(display)  # noqa: F841  (keep references alive)
 
     S.dirty.set()
+    last_refresh = time.monotonic()
     while True:
         busy = (S.toast and time.monotonic() < S.toast[3] + 0.5) or S.pairing_until > time.monotonic()
         S.dirty.wait(timeout=1 if busy else 5)
+        if time.monotonic() - last_refresh > 30:          # recover from a power-dip reset
+            last_refresh = time.monotonic()
+            try:
+                display.refresh_config()
+                S.dirty.set()
+            except Exception as e:
+                log.warning("screen refresh: %s", e)
         S.dirty.clear()
         if S.screen_on:
             display.display(render())

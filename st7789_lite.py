@@ -72,6 +72,7 @@ class ST7789:
             lgpio.gpio_claim_output(self.chip, backlight, 0)
         if rst is not None:
             lgpio.gpio_claim_output(self.chip, rst, 1)
+        self._invert = invert
         self._init(invert)
         self.set_backlight(1)
 
@@ -99,6 +100,16 @@ class ST7789:
         self.cmd(0x21 if invert else 0x20)                      # INVON/OFF
         self.cmd(0x11); time.sleep(0.12)                        # SLPOUT
         self.cmd(0x29); time.sleep(0.1)                         # DISPON
+
+    def refresh_config(self):
+        """Re-send the panel setup without a reset (no flicker). If a power dip reset the
+        controller, this brings it back; on a healthy panel it changes nothing."""
+        self.cmd(0x11)                                          # SLPOUT (no-op if awake)
+        self.cmd(0x36, self.p["madctl"])
+        for c in self.p["init"]:
+            self.cmd(*c)
+        self.cmd(0x21 if self._invert else 0x20)
+        self.cmd(0x29)                                          # DISPON
 
     # -- public API
     def set_backlight(self, value):

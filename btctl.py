@@ -31,19 +31,40 @@ _timers = {}
 # then exits, which knocks out moOde's agent and makes pairing hang on the phone.
 
 
-def _busctl(*args, timeout=6):
-    r = subprocess.run(["sudo", "-n", "busctl", "--system", "--json=short", *args],
-                       capture_output=True, text=True, timeout=timeout)
+_read_needs_root = None     # learned on first read: does BlueZ let us read without sudo?
+
+
+def _busctl(*args, timeout=6, root=True):
+    """Run busctl. Writes always use sudo -n; reads skip sudo when BlueZ allows it,
+    so the journal isn't flooded with a sudo log line every second."""
+    cmd = ["busctl", "--system", "--json=short", *args]
+    if root:
+        cmd = ["sudo", "-n"] + cmd
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if r.returncode:
-        log.warning("busctl %s: %s", " ".join(args[:4]), (r.stderr or r.stdout).strip()[:200])
+        if root:
+            log.warning("busctl %s: %s", " ".join(args[:4]), (r.stderr or r.stdout).strip()[:200])
         return None
     out = r.stdout.strip()
     return json.loads(out) if out else {}
 
 
+def _read(*args):
+    global _read_needs_root
+    if _read_needs_root is not True:
+        r = _busctl(*args, root=False)
+        if r is not None:
+            _read_needs_root = False
+            return r
+        if _read_needs_root is None:
+            log.info("BlueZ reads need sudo on this system")
+        _read_needs_root = True
+    return _busctl(*args, root=True)
+
+
 def _objects():
     """{path: {interface: {prop: value}}} for everything BlueZ manages."""
-    r = _busctl("call", "org.bluez", "/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects")
+    r = _read("call", "org.bluez", "/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects")
     if not r:
         return {}
     data = r["data"][0] if isinstance(r.get("data"), list) else r.get("data", {})
