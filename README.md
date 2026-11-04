@@ -1,84 +1,118 @@
-# Pirate Audio + moOde: now playing, battery & connection control
+# moOde speaker screen: now playing, battery & connection control
 
-A small screen for a moOde-based portable speaker. It shows what's playing
-and who's connected, tracks a LiFePO4 battery, and lets you manage
-who's connected with buttons on the box.
+A small screen for a battery-powered moOde speaker. It shows what's playing
+and who's connected, tracks a LiFePO4 battery, and lets you control the
+speaker from a knob and a touch screen on the box.
 
-Built for a Raspberry Pi running **moOde 10.x (Trixie, 64-bit)**. Two
-hardware setups are supported (set `PANEL` at the top of `display.py`):
+Built for a Raspberry Pi running **moOde 10.x (Trixie, 64-bit)**:
 
-| | Screen | DAC | Buttons |
-|---|---|---|---|
-| **Current build** (`PANEL = "waveshare2"`) | Waveshare 2" 240×320 ST7789 IPS, used landscape (320×240) | Raspberry Pi DAC+ (PCM5122) | Panel-mount, wired to the DAC+ passthrough header |
-| **Original** (`PANEL = "pirate"`) | Pimoroni Pirate Audio Line-Out, 240×240 | PCM5100A on the same board | The board's A/B/X/Y |
+| Part | Used here |
+|---|---|
+| Pi | Raspberry Pi 3B+ |
+| DAC | Raspberry Pi DAC+ (PCM5122), with GPIO passthrough header |
+| Screen | Waveshare 2" 240×320 ST7789 IPS, used landscape (320×240). The capacitive-touch version (CST816D) adds touch; the plain one works without it |
+| Controls | Rotary encoder with push switch (EC11-style) |
+| Battery monitor | INA226 module with a 2 mΩ shunt |
+| Power | Mean Well SD-15B-5 (25.6 V pack → 5 V) |
 
-Tested on a Pi 3B+ (Waveshare + DAC+) and a Pi Zero 2 W (Pirate Audio).
+The project started on a Pimoroni Pirate Audio (240×240). That version is in
+the git history (and `legacy/`); the current UI needs the 320×240 screen.
 
 ## Features
 
-- **Now playing for any moOde source.** It follows moOde's own
+- **Ambient Glass UI.** Blurred album art behind everything while music
+  plays, a single dark brand backdrop otherwise. Every screen uses the same
+  status bar and glass cards. Run `python3 preview.py` on any computer to
+  render every screen to `preview_sheet.png`.
+- **Bluetooth first.** Like any Bluetooth speaker, the box is discoverable
+  whenever nothing is connected or playing, and the idle screen tells people
+  which name to pick. It hides as soon as someone connects, so nobody can grab
+  it mid-song. Phones that have already paired can always reconnect.
+- **Now playing for any moOde source**, following moOde's own
   active-renderer flags:
   - **AirPlay:** title, artist and cover art from moOde's
     `/var/local/www/aplmeta.json`. The script never reads the shairport
     metadata pipe, because moOde already reads it and two readers on one
-    pipe each get random pieces of the data. That was the cause of the old
-    "AirPlay is flaky" problem.
+    pipe each get random pieces of the data.
   - **Bluetooth:** title, artist, album, play state and cover art from
-    moOde's `/var/local/www/btmeta.json`, plus the connected phone's name
-    from BlueZ. moOde finds the cover by looking the song up in Apple's
-    catalog; the display downloads it once and keeps it in `art_cache/`, so
-    songs you've played before show art **offline** (play your walk-up
-    playlist once at home and the whole set is cached).
+    moOde's `/var/local/www/btmeta.json`, plus the phone's name from BlueZ.
+    Covers are downloaded once and cached in `art_cache/`, so songs you've
+    played before show art **offline**.
   - **Radio:** "Artist - Title" stream titles get art the same way.
-  - **Spotify / other renderers:** shows the source label.
   - **Library / radio / UPnP:** from MPD, with embedded cover art.
-- **Who's connected:** a full-screen "Connected: Maddux's iPhone" splash
-  when a phone connects, and a matching one on disconnect.
-- **Shared-speaker controls:**
-  - **Hold A (2 s) to kick.** Disconnects the current Bluetooth phone and
-    blocks it for 5 minutes so it can't grab the speaker right back. Also
-    drops an active AirPlay sender. Blocks are saved to a file and lifted on
-    restart, so nobody stays blocked by accident.
-  - **Hold B (2 s) for pairing mode.** The speaker is discoverable for up
-    to 2 minutes, with a countdown and the name to look for on screen. The
-    window closes as soon as a phone connects. Otherwise it stays hidden
-    from new devices; phones that have already paired can still connect.
-- **Battery (INA226 coulomb counter):** percentage, runtime left,
-  voltage/current/power and peak current. It syncs to 100% on a full
+- **Playback control.** Play/pause and next track go to the phone over
+  AVRCP (Bluetooth), to MPD, or to shairport-sync's remote control when
+  moOde's build has it (otherwise the box says to use the phone).
+- **Menu:** disconnect the current phone (it's blocked for 5 minutes so it
+  can't grab the speaker right back), let a second phone pair while one is
+  connected, next track, screens, and a controls cheat sheet.
+- **Popups** for phone connected/disconnected, low battery (20 % and 10 %),
+  fully charged, CPU running hot and Pi under-voltage.
+- **Battery (INA226 coulomb counter):** ring gauge, runtime left,
+  voltage/current/power/peak. With the charger connected it switches to a
+  charging view with input watts and time to full. It syncs to 100 % on a full
   charge and keeps its count across restarts.
-- **Short presses:** A = screen on/off, B = now playing ↔ battery detail,
-  X/Y = volume.
+- **System screen:** CPU temperature, power-supply health, Wi-Fi/hotspot,
+  IP address, uptime and Bluetooth visibility.
+- **Backlight dimming:** full brightness while playing; dims when paused or
+  idle, and turns off after 10 minutes with nobody connected. Any event wakes
+  it (a touch on a dark screen only wakes it).
+- **Boot splash** early in boot (`pirate-splash.service`), and a "safe to
+  switch off" screen on `sudo poweroff`.
+
+## Controls
+
+| | Knob | Touch screen |
+|---|---|---|
+| Volume | Turn | — |
+| Play / pause | Press | Tap |
+| Next track | Press twice | Menu |
+| Change screen | Menu | Swipe left / right |
+| Menu | Hold 1 s | Tap the top bar, or hold a finger down |
+| Close | Hold again | Tap ✕, or tap a popup to dismiss it |
+
+In the menu, turn the knob to move and press to choose. Disconnecting needs a
+second press (or tap) to confirm.
+
+**Bench control pipe.** Every control can be tested without the knob or touch
+screen fitted:
+
+```bash
+cd ~/pirate-audio
+echo press > ctl          # also: double, hold, +, -, left, right, "tap 160 120"
+```
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `display.py` | Main program: rendering, buttons, battery thread |
+| `display.py` | Main program and all settings: state, menu, input handling, backlight, battery/system threads |
+| `ui.py` | Draws every screen (pure PIL, no hardware) |
+| `inputs.py` | Knob (rotary encoder + switch), touch gestures, bench control pipe |
+| `cst816.py` | CST816D touch controller driver |
 | `sources.py` | Works out what moOde is playing and gets the metadata |
-| `btctl.py` | Bluetooth kick/block, pairing mode, AirPlay drop |
-| `st7789_lite.py` | Minimal ST7789 driver (spidev + lgpio) for both panels; avoids `gpiodevice` |
-| `artlookup.py` | Downloads and caches cover art (moOde's URL, or an iTunes search as a fallback) |
-| `screen_test.py` | Bench test: border, "up" arrow and colour bars, to check wiring and rotation |
+| `btctl.py` | Bluetooth visibility, kick/block, AVRCP play/pause/next, AirPlay drop |
+| `st7789_lite.py` | Minimal ST7789 driver (spidev + lgpio) with PWM backlight |
+| `artlookup.py` | Downloads and caches cover art |
 | `ina226.py` | INA226 driver and LiFePO4 battery gauge |
-| `ina_test.py` | Bench test for the INA226 |
-| `setup.sh` | One-time install (packages, venv, SPI fix, service) |
-| `pirate-audio.service` | systemd unit template (filled in by `setup.sh`) |
-| `legacy/` | The original scripts, kept for reference |
+| `splash.py` | Early-boot splash (a cached image from the last run) |
+| `preview.py` | Renders every screen with sample data to `preview_sheet.png` |
+| `screen_test.py`, `touch_test.py`, `ina_test.py` | Bench tests |
+| `setup.sh` | One-time install (packages, venv, SPI fix, services) |
+| `pirate-audio.service`, `pirate-splash.service` | systemd unit templates |
 
 ## Install
 
 1. Flash **moOde 10.x** with Raspberry Pi Imager. In Edit Settings, set
-   the hostname, user/password, Wi-Fi (2.4 GHz for a Zero 2 W) and
-   **enable SSH**.
+   the hostname, user/password and Wi-Fi, and **enable SSH**.
 2. In the moOde web UI:
    - **Configure → Audio → Named I2S device:** **Raspberry Pi DAC+** (it is
-     auto-detected from its ID EEPROM, so no `dtoverlay` line appears), or
-     **HiFiBerry DAC** for the Pirate Audio.
-   - **Configure → Renderers:** turn on **AirPlay** and **Bluetooth**.
+     auto-detected from its ID EEPROM, so no `dtoverlay` line appears).
+   - **Configure → Renderers:** turn on **AirPlay** and **Bluetooth**. The
+     Bluetooth name you set there is the name the screen tells people to pick.
    - In the Bluetooth settings, **turn off pairing confirmation.**
      Otherwise moOde waits for someone to click "accept" in its web UI and
-     the phone times out. The box's own pairing mode controls when new
-     phones can pair.
+     the phone times out. This program decides when the box is discoverable.
 3. On the Pi:
    ```bash
    git clone https://github.com/jmyler/MoodePirateAudio ~/pirate-audio
@@ -92,10 +126,15 @@ Tested on a Pi 3B+ (Waveshare + DAC+) and a Pi Zero 2 W (Pirate Audio).
    journalctl -u pirate-audio -f
    ```
 
-Bluetooth control talks to BlueZ directly over D-Bus (`busctl` through
+Updating an existing install: `git pull`, then run `./setup.sh` again (it
+adds `fonts-inter` and the splash service), then
+`sudo systemctl restart pirate-audio`.
+
+Bluetooth control talks to BlueZ directly over D-Bus (`busctl`, writes through
 `sudo -n`). It deliberately **never runs `bluetoothctl`**: every
 `bluetoothctl` invocation registers itself as the pairing agent and then
 exits, which knocks out moOde's agent and makes pairing hang on the phone.
+Volume goes through moOde's `/var/www/util/vol.sh` so the web UI stays in sync.
 The user that Imager creates has passwordless sudo by default; check with
 `sudo -n true && echo ok`.
 
@@ -106,23 +145,25 @@ with `sudo systemctl disable --now pirate-audio`.
 
 Settings are at the top of `display.py`:
 
-- `CAPACITY_AH`, `CELLS`: battery pack (default 8S, 25.6 V LiFePO4)
+- `CAPACITY_AH`, `CELLS`: battery pack (default 8S 25.6 V, 6 Ah)
 - `SHUNT_OHMS`, `CURRENT_GAIN`, `CURRENT_SIGN`: INA226 shunt calibration
-- `PANEL`, `ROTATION` (90 or 270), `SCREEN_PINS`: which screen and how it's mounted
-- `BUTTONS`: GPIO pins (A=5, B=6, X=16, Y=24, the Pirate Audio's pins)
-- `HIDE_BY_DEFAULT`: set to `False` to stay discoverable all the time
-- `PAIR_S`, `LONG_PRESS_S`, `PAIR_HINT`
-- `btctl.HOLD_S`: how long a kicked phone stays blocked
+- `LOW_ALERTS`: low-battery popup thresholds
+- `PANEL`, `ROTATION` (90 or 270), `SCREEN_PINS`
+- `KNOB`, `KNOB_REVERSE`, `KNOB_HOLD_S`, `DOUBLE_S`
+- `TOUCH` (`"auto"`, `True`, `False`), `TOUCH_PINS`, `TOUCH_MAP`
+- `VOL_STEP`, `VOL_MAX` (a cap, e.g. 85)
+- `PAIR_S`: how long "Add a phone" stays open
+- `BRIGHT_DIM`, `DIM_PAUSED_S`, `DIM_IDLE_S`, `OFF_IDLE_S`
+- `HOT_C`: CPU temperature warning
+- `btctl.HOLD_S`: how long a disconnected phone stays blocked
 
-Optional: put a 240×240 `jm_logo.jpeg` next to `display.py` to use as the
-idle screen.
+## Wiring
 
-## Wiring (current build)
+Everything plugs into the Raspberry Pi DAC+'s passthrough header (a GPIO
+screw-terminal board on top makes the shared I2C and ground connections
+easy). Physical pin 1 is at the SD-card end; odd pins are the inner row.
 
-Everything plugs into the Raspberry Pi DAC+'s passthrough header. Physical
-pin numbers: pin 1 is at the SD-card end, and odd pins are the inner row.
-
-**Waveshare 2" screen**
+**Screen (Waveshare 2", touch or non-touch)**
 
 | Screen | Pi pin | GPIO |
 |---|---|---|
@@ -133,22 +174,22 @@ pin numbers: pin 1 is at the SD-card end, and odd pins are the inner row.
 | CS | 26 | 7 (CE1) |
 | DC | 21 | 9 |
 | RST | 13 | 27 |
-| BL | 33 | 13 |
+| BL | 33 | 13 (PWM) |
+| TP_SDA | 3 | 2 (shared I2C) |
+| TP_SCL | 5 | 3 (shared I2C) |
+| TP_INT | 7 | 4 |
+| TP_RST | 11 | 17 |
 
-**Buttons:** each button goes between its GPIO and GND. The internal
-pull-ups are enabled, so a jumper touched to GND works as a button on the
-bench.
+**Knob (rotary encoder with push switch).** Common pin(s) to GND; internal
+pull-ups are used.
 
-| Button | GPIO | Pi pin |
+| Knob | GPIO | Pi pin |
 |---|---|---|
-| A (screen / kick) | 5 | 29 |
-| B (view / pairing) | 6 | 31 |
-| X (vol +) | 16 | 36 |
-| Y (vol −) | 24 | 18 |
+| A | 5 | 29 |
+| B | 6 | 31 |
+| Switch | 16 | 36 |
 
-None of these pins are used by the DAC+ (I2S on 18–21, I2C, GPIO 22 mute).
-
-## Wiring the INA226
+**INA226**
 
 | INA226 | Pi (physical pin) |
 |---|---|
@@ -159,29 +200,40 @@ None of these pins are used by the DAC+ (I2S on 18–21, I2C, GPIO 22 mute).
 | IN+ / IN− | inline with battery + (high side) |
 | VBUS | battery + |
 
-`i2cdetect -y 1` should show the INA226 at **0x40** (and the DAC+ at 0x4c
-or `UU`). Run
-`venv/bin/python ina_test.py` to check the readings.
+**5 V in:** Mean Well 5 V to pins 2 **and** 4, ground to two GND pins. One
+pin of each is not enough for a Pi 3B+ (under-voltage, screen resets).
+
+**Pins in use:** GPIO 0/1 (DAC+ EEPROM), 2/3 (I2C: DAC+, INA226, touch),
+4, 5, 6, 7, 8 (claimed by `spi0-2cs`), 9, 10, 11, 13, 16, 17, 18–21 (I2S),
+22 (DAC+ mute, reserved), 27. **Free:** 12, 14, 15, 23, 24, 25, 26. 23 and 26
+are earmarked for a soft-latching power switch, and 24 for amp mute.
+
+`i2cdetect -y 1` should show the INA226 at **0x40**, the touch controller at
+**0x15** (it may only answer after a touch or a reset) and the DAC+ at 0x4c
+or `UU`.
 
 ## Gotchas this fixes
 
 - **"Invalid argument" claiming GPIO 9:** on newer kernels the SPI driver
-  owns MISO (GPIO 9), which the Pirate Audio uses for the screen's DC line.
-  `setup.sh` replaces `dtparam=spi=on` with `dtoverlay=spi0-2cs,no_miso`.
-  moOde can rewrite `config.txt` when you change audio settings, so if the
-  screen stops working, check that this line is still there.
+  owns MISO (GPIO 9), which is the screen's DC line. `setup.sh` replaces
+  `dtparam=spi=on` with `dtoverlay=spi0-2cs,no_miso`.
+- **moOde rewrote `config.txt` and the screen died:** changing the audio
+  device in moOde can drop the `spi0-2cs,no_miso` line. Check with
+  `grep -n spi /boot/firmware/config.txt` after any audio change.
 - **Pimoroni's `st7789` / `gpiodevice` failing on Trixie:** this project
   uses its own small driver (`st7789_lite.py`) instead.
 - **AirPlay metadata missing or random:** read moOde's `aplmeta.json`,
   not the pipe.
-- **moOde rewrote `config.txt` and the screen died:** changing the audio
-  device in moOde can drop the `spi0-2cs,no_miso` line. Check with
-  `grep -n spi /boot/firmware/config.txt` after any audio change.
 - **Screen backlight on but nothing drawn:** a data wire is on the wrong
   pin, usually off by a row. Run `pinout` on the Pi for a labelled map.
+- **Screen blanks or the Pi reboots under load:** check
+  `vcgencmd get_throttled`; anything but `0x0` means the 5 V feed is
+  sagging (see Wiring). The System screen shows this too.
 - **"GPIO busy":** the service is already running and holding the pins.
 - **Bluetooth pairing times out on the phone:** moOde's pairing
   confirmation is on (see Install), or something ran `bluetoothctl` and
   displaced moOde's agent. Reboot to bring the agent back.
+- **Taps land in the wrong place:** run `venv/bin/python touch_test.py`
+  and set `TOUCH_MAP`.
 - **SD card verify failures in Imager:** try a different card reader
   before blaming the card.

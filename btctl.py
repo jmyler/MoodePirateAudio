@@ -3,8 +3,8 @@
 - connected(): [(mac, name)] of connected Bluetooth devices
 - kick(): disconnect the current Bluetooth device and block it for HOLD_S
   so it can't immediately auto-reconnect; also drops an AirPlay sender
-- pairing_mode(seconds): discoverable + pairable for a while, then hidden again
-- hide(): not discoverable (paired devices can still connect)
+- set_visible(on): discoverable + pairable, or hidden (paired phones can still connect)
+- player(cmd): Play / Pause / Next / Previous on the connected phone (AVRCP)
 
 Blocks are recorded in a state file and lifted on startup, so a crash can
 never leave someone's phone permanently blocked.
@@ -170,19 +170,37 @@ def hide():
     _set_adapter("Discoverable", "b", "false")
 
 
-def pairing_mode(seconds, on_done=None):
-    _set_adapter("Pairable", "b", "true")
-    _set_adapter("DiscoverableTimeout", "u", "0")
-    _set_adapter("Discoverable", "b", "true")
+def set_visible(on):
+    """Bluetooth-first speaker behaviour: discoverable/pairable when on, hidden when off.
+    Phones that have already paired can always reconnect."""
+    if on:
+        _set_adapter("Pairable", "b", "true")
+        _set_adapter("DiscoverableTimeout", "u", "0")
+    _set_adapter("Discoverable", "b", "true" if on else "false")
 
-    def end():
-        hide()
-        if on_done:
-            on_done()
-    t = threading.Timer(seconds, end)
-    t.daemon = True
-    t.start()
-    return t
+
+def is_visible():
+    objs = _objects()
+    return bool(objs.get(adapter_path(objs), {}).get("org.bluez.Adapter1", {}).get("Discoverable"))
+
+
+def _player_path(objs=None):
+    """MediaPlayer1 object of the connected phone (AVRCP), or None."""
+    objs = objs if objs is not None else _objects()
+    devs = [p for p, i in objs.items() if i.get("org.bluez.Device1", {}).get("Connected")]
+    for path, ifaces in objs.items():
+        if "org.bluez.MediaPlayer1" in ifaces and any(path.startswith(d + "/") for d in devs):
+            return path
+    return None
+
+
+def player(cmd):
+    """Send an AVRCP command to the connected phone: Play, Pause, Next, Previous.
+    Returns True if a player was found and the call went through."""
+    path = _player_path()
+    if not path:
+        return False
+    return _busctl("call", "org.bluez", path, "org.bluez.MediaPlayer1", cmd) is not None
 
 
 def alias():

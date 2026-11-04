@@ -40,7 +40,7 @@ def _flags():
     con = sqlite3.connect(DB, uri=True, timeout=2)
     try:
         rows = con.execute("select param, value from cfg_system where param like '%active' "
-                           "or param like '%svc'").fetchall()
+                           "or param like '%svc' or param in ('airplayname', 'volknob')").fetchall()
     finally:
         con.close()
     return {k: str(v) for k, v in rows}
@@ -206,7 +206,7 @@ class SourceWatcher(threading.Thread):
         flags = _flags()
         inputs = [lbl for k, lbl in SERVICES if flags.get(k) == "1"]
         active = next((lbl for k, lbl in RENDERERS if flags.get(k) == "1"), None)
-        self.S.set(inputs=tuple(inputs))
+        self.S.set(inputs=tuple(inputs), airplay_name=flags.get("airplayname", ""), ready=True)
 
         if active == "AirPlay":
             meta, _ = self._json_meta(APLMETA)

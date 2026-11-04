@@ -4,3 +4,6 @@ __pycache__/
 battery_state.json*
 bt_blocks.json*
 art_cache/
+ctl
+splash.png*
+preview_sheet.png

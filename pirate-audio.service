@@ -1,11 +1,11 @@
 [Unit]
 Description=Pirate Audio display + battery monitor
-After=network.target bluetooth.target mpd.service
+After=network.target bluetooth.target mpd.service pirate-splash.service
 
 [Service]
 Type=simple
 User=__USER__
-SupplementaryGroups=spi i2c gpio
+SupplementaryGroups=spi i2c gpio video
 WorkingDirectory=__DIR__
 ExecStart=__DIR__/venv/bin/python __DIR__/display.py
 Restart=always

@@ -73,6 +73,8 @@ class ST7789:
         if rst is not None:
             lgpio.gpio_claim_output(self.chip, rst, 1)
         self._invert = invert
+        self._pwm_on = False
+        self.pwm_hz = 1000
         self._init(invert)
         self.set_backlight(1)
 
@@ -113,8 +115,19 @@ class ST7789:
 
     # -- public API
     def set_backlight(self, value):
-        if self.bl is not None:
-            lgpio.gpio_write(self.chip, self.bl, 1 if value else 0)
+        """0..1. In-between values dim the panel with PWM on the backlight pin
+        (GPIO 13 by default); 0 and 1 are plain off/on."""
+        if self.bl is None:
+            return
+        value = max(0.0, min(1.0, float(value)))
+        if value in (0.0, 1.0):
+            if self._pwm_on:
+                lgpio.tx_pwm(self.chip, self.bl, 0, 0)          # stop PWM
+                self._pwm_on = False
+            lgpio.gpio_write(self.chip, self.bl, int(value))
+        else:
+            lgpio.tx_pwm(self.chip, self.bl, self.pwm_hz, round(value * 100, 1))
+            self._pwm_on = True
 
     def display(self, image):
         x0, y0 = self.x_off, self.y_off
