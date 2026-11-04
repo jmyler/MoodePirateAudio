@@ -199,7 +199,7 @@ easy). Physical pin 1 is at the SD-card end; odd pins are the inner row.
 | TP_INT | 7 | 4 |
 | TP_RST | 11 | 17 |
 
-**Knob (rotary encoder with push switch).** Common pin(s) to GND; internal
+**Knob (optional, not fitted by default).** Common pin(s) to GND; internal
 pull-ups are used.
 
 | Knob | GPIO | Pi pin |
