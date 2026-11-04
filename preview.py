@@ -59,7 +59,7 @@ def menu(sel=0, confirming=False):
     return dict(title="JPhone connected", items=items, sel=sel)
 
 
-def sheet(dev, sel=0, confirming=False):
+def phone_sheet(dev, sel=0, confirming=False):
     from display import phone_items
     items = phone_items(dev)
     if confirming:
@@ -93,8 +93,8 @@ def screens():
         ]),
         ("New: phones, join, session stats", [
             ("Phones (knob highlight)", dict(BASE, view="phones", phone_sel=1, phone_focus=True)),
-            ("Phone actions", dict(BASE, view="phones", menu=sheet(PHONES[0]))),
-            ("Forget: confirm", dict(BASE, view="phones", menu=sheet(PHONES[1], 0, True))),
+            ("Phone actions", dict(BASE, view="phones", menu=phone_sheet(PHONES[0]))),
+            ("Forget: confirm", dict(BASE, view="phones", menu=phone_sheet(PHONES[1], 0, True))),
             ("Menu: Controls pill selected", dict(BASE, menu=menu(6))),
         ]),
         ("", [
