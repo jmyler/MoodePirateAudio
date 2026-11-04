@@ -45,7 +45,17 @@ the git history (and `legacy/`); the current UI needs the 320×240 screen.
   moOde's build has it (otherwise the box says to use the phone).
 - **Menu:** disconnect the current phone (it's blocked for 5 minutes so it
   can't grab the speaker right back), let a second phone pair while one is
-  connected, next track, screens, and a controls cheat sheet.
+  connected, jump to any screen, and a controls cheat sheet.
+- **Phones screen:** every paired phone, connected one first, with blocked
+  phones and their minutes left. Pick one to disconnect, unblock it early, or
+  **forget** it (it has to pair again), which keeps a shared speaker from being
+  grabbed by every phone that ever paired.
+- **Join screen:** two QR codes. One joins the Wi-Fi the speaker is on (its
+  own hotspot at the field, or your home network) so phones can use AirPlay;
+  the other opens the moOde web UI. The Wi-Fi password comes from
+  NetworkManager (`sudo nmcli`), or set `WIFI_QR_PSK`.
+- **Session stats:** time on, Ah and % of the pack used, average and peak
+  draw, and a graph of current draw over the last few hours.
 - **Popups** for phone connected/disconnected, low battery (20 % and 10 %),
   fully charged, CPU running hot and Pi under-voltage.
 - **Battery (INA226 coulomb counter):** ring gauge, runtime left,
@@ -71,8 +81,17 @@ the git history (and `legacy/`); the current UI needs the 320×240 screen.
 | Menu | Hold 1 s | Tap the top bar, or hold a finger down |
 | Close | Hold again | Tap ✕, or tap a popup to dismiss it |
 
-In the menu, turn the knob to move and press to choose. Disconnecting needs a
-second press (or tap) to confirm.
+Screens, in swipe order: **Now playing → Battery → Session stats → Phones →
+Join → System.** Info screens go back to Now playing after a minute untouched.
+
+In the menu, turn the knob to move and press to choose. Disconnecting and
+forgetting need a second press (or tap) to confirm. On the Phones screen the
+knob picks a phone instead of changing volume; press (or tap a row) for its
+actions.
+
+For the Join screen to be useful away from home, set up moOde's hotspot
+(Configure → Network) and check once that it comes up when no known Wi-Fi is
+in range.
 
 **Bench control pipe.** Every control can be tested without the knob or touch
 screen fitted:

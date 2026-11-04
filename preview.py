@@ -36,6 +36,17 @@ BASE = dict(source="Bluetooth", device="JPhone", playing=True, title="Industry B
             inputs=("AirPlay", "Bluetooth"), t=0.0, touch=True,
             sys=dict(temp=54.2, uv_now=False, uv_seen=False, ssid="Home Wi-Fi", rssi=-58,
                      ip="192.168.1.42", host="moode.local", uptime=7980))
+import math as _m
+PHONES = [dict(mac="A", name="JPhone", connected=True, blocked=False, blocked_until=0),
+          dict(mac="B", name="Maddux's iPad", connected=False, blocked=False, blocked_until=0),
+          dict(mac="C", name="Coach Mike's Galaxy", connected=False, blocked=True, blocked_until=240),
+          dict(mac="D", name="JP's iPhone", connected=False, blocked=False, blocked_until=0),
+          dict(mac="E", name="Pixel 8", connected=False, blocked=False, blocked_until=0)]
+BASE["phones"], BASE["now_wall"] = PHONES, 0
+BASE["join"] = dict(ssid="JS Speaker", hotspot=True, psk="walkup2026", ip="10.42.0.1", host="moode.local")
+BASE["stats"] = dict(uptime=9000, used_ah=3.4, used_pct=57, avg=1.36, peak=4.6,
+                     hist=[(9000 - k * 30, 1.2 + 0.6 * _m.sin(k / 9) + (1.8 if k % 37 == 0 else 0))
+                           for k in range(300)])
 IDLE = dict(BASE, source=None, device="", playing=False, title="", artist="", album="", art=None,
             bt_visible=True)
 
@@ -46,6 +57,14 @@ def menu(sel=0, confirming=False):
     if confirming:
         items[0]["confirming"] = True
     return dict(title="JPhone connected", items=items, sel=sel)
+
+
+def sheet(dev, sel=0, confirming=False):
+    from display import phone_items
+    items = phone_items(dev)
+    if confirming:
+        items[sel]["confirming"] = True
+    return dict(title=dev["name"], subtitle="Connected" if dev["connected"] else "Paired", items=items, sel=sel)
 
 
 def screens():
@@ -71,6 +90,19 @@ def screens():
                                  popup=dict(icon="battery", color=ui.RED, small="Battery low",
                                             big="12% · ~24 m"))),
             ("Pair another phone", dict(BASE, pairing_left=(102, 0.85))),
+        ]),
+        ("New: phones, join, session stats", [
+            ("Phones (knob highlight)", dict(BASE, view="phones", phone_sel=1, phone_focus=True)),
+            ("Phone actions", dict(BASE, view="phones", menu=sheet(PHONES[0]))),
+            ("Forget: confirm", dict(BASE, view="phones", menu=sheet(PHONES[1], 0, True))),
+            ("Menu: Controls pill selected", dict(BASE, menu=menu(6))),
+        ]),
+        ("", [
+            ("Join (hotspot)", dict(BASE, view="join")),
+            ("Session stats", dict(BASE, view="stats")),
+            ("Phones (none paired)", dict(IDLE, view="phones", phones=[])),
+            ("Stats just started", dict(BASE, view="stats", stats=dict(uptime=40, used_ah=0.01, used_pct=0.2,
+                                                                       avg=1.1, peak=1.4, hist=[]))),
         ]),
         ("Battery & system (swipe)", [
             ("Battery", dict(BASE, view="battery")),

@@ -141,21 +141,7 @@ def startup_cleanup():
 
 def kick():
     """Disconnect + temporarily block the connected phone(s). Returns names kicked."""
-    names = []
-    for mac, name in connected():
-        _busctl("call", "org.bluez", _dev_path(mac), "org.bluez.Device1", "Disconnect")
-        _block(mac, True)
-        with _lock:
-            d = _load()
-            d[mac] = {"name": name, "until": time.time() + HOLD_S}
-            _save(d)
-            t = threading.Timer(HOLD_S, _unblock, args=(mac,))
-            t.daemon = True
-            _timers[mac] = t
-            t.start()
-        names.append(name)
-        log.info("kicked %s (%s) for %d s", name, mac, HOLD_S)
-    return names
+    return [disconnect(mac) for mac, _ in connected()]
 
 
 def kick_airplay():
@@ -201,6 +187,64 @@ def player(cmd):
     if not path:
         return False
     return _busctl("call", "org.bluez", path, "org.bluez.MediaPlayer1", cmd) is not None
+
+
+def devices():
+    """Paired phones, connected first: [dict(mac, name, connected, blocked_until)]."""
+    blocks = _load()
+    out = []
+    for path, ifaces in _objects().items():
+        d = ifaces.get("org.bluez.Device1")
+        if not d or not d.get("Paired"):
+            continue
+        mac = d.get("Address", "")
+        b = blocks.get(mac) or {}
+        out.append(dict(mac=mac, name=d.get("Alias") or d.get("Name") or mac,
+                        connected=bool(d.get("Connected")), blocked_until=b.get("until", 0)
+                        if d.get("Blocked") else 0, blocked=bool(d.get("Blocked"))))
+    out.sort(key=lambda x: (not x["connected"], x["name"].lower()))
+    return out
+
+
+def disconnect(mac):
+    """Disconnect one phone and block it for HOLD_S (same as kick, for a single device)."""
+    name = next((n for m, n in connected() if m.upper() == mac.upper()), mac)
+    _busctl("call", "org.bluez", _dev_path(mac), "org.bluez.Device1", "Disconnect")
+    _block(mac, True)
+    with _lock:
+        d = _load()
+        d[mac] = {"name": name, "until": time.time() + HOLD_S}
+        _save(d)
+        t = threading.Timer(HOLD_S, _unblock, args=(mac,))
+        t.daemon = True
+        _timers[mac] = t
+        t.start()
+    log.info("disconnected %s (%s) for %d s", name, mac, HOLD_S)
+    return name
+
+
+def unblock(mac):
+    with _lock:
+        t = _timers.pop(mac, None)
+    if t:
+        t.cancel()
+    _unblock(mac)
+
+
+def forget(mac):
+    """Remove the pairing: the phone has to pair again (via the box's pairing window)."""
+    objs = _objects()
+    path = _dev_path(mac, objs)
+    with _lock:
+        t = _timers.pop(mac, None)
+        d = _load()
+        d.pop(mac, None)
+        _save(d)
+    if t:
+        t.cancel()
+    ok = _busctl("call", "org.bluez", adapter_path(objs), "org.bluez.Adapter1", "RemoveDevice", "o", path) is not None
+    log.info("forgot %s: %s", mac, "ok" if ok else "failed")
+    return ok
 
 
 def alias():

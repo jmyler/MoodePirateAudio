@@ -222,6 +222,24 @@ def icon(d, kind, cx, cy, sz, c):
         speaker_glyph(d, cx, cy, sz, c)
     elif kind == "pause":
         pause_glyph(d, cx, cy, sz * .8, c)
+    elif kind == "phone":
+        d.rounded_rectangle(s(cx - sz * .3, cy - sz * .5, cx + sz * .3, cy + sz * .5), 2.5 * SS, outline=c,
+                            width=int(1.6 * SS))
+        d.line(s(cx - sz * .1, cy + sz * .32, cx + sz * .1, cy + sz * .32), fill=c, width=int(1.4 * SS))
+    elif kind == "qr":
+        k = sz / 2
+        for ox, oy in ((-1, -1), (1, -1), (-1, 1)):
+            x0, y0 = cx + ox * k * .55, cy + oy * k * .55
+            d.rectangle(s(x0 - k * .38, y0 - k * .38, x0 + k * .38, y0 + k * .38), outline=c, width=int(1.4 * SS))
+        d.rectangle(s(cx + k * .35, cy + k * .35, cx + k * .75, cy + k * .75), fill=c)
+    elif kind == "chart":
+        k = sz / 2
+        d.line([s(cx - k, cy + k * .5), s(cx - k * .3, cy - k * .1), s(cx + k * .2, cy + k * .3),
+                s(cx + k, cy - k * .6)], fill=c, width=int(1.8 * SS), joint="curve")
+    elif kind == "x":
+        k = sz * .35
+        d.line(s(cx - k, cy - k, cx + k, cy + k), fill=c, width=int(2 * SS))
+        d.line(s(cx - k, cy + k, cx + k, cy - k), fill=c, width=int(2 * SS))
 
 
 # ---------------------------------------------------------------- backgrounds (cached)
@@ -611,25 +629,39 @@ def ov_pairing(im, left, name, other):
     return im
 
 
-# Menu: 3 x 2 grid of big tiles (finger-sized on a 2" screen); same geometry for touch hit-testing
-MENU_GRID = dict(x0=14, y0=46, cols=3, rows=2, tw=92, th=86, gap=8)
+# Menu: up to 3 x 2 grid of big tiles (finger-sized on a 2" screen), plus optional header
+# items (the "? Controls" pill). The same geometry is used for touch hit-testing.
+MENU_GRID = dict(x0=14, y0=46, cols=3, tw=92, th=86, gap=8)
 MENU_CLOSE = (262, 8, 314, 40)
+MENU_PILL = (178, 10, 254, 38)
 
 
-def menu_tile_box(k):
+def _tile_items(items):
+    return [k for k, it in enumerate(items) if not it.get("header")]
+
+
+def menu_tile_box(slot, n):
     g = MENU_GRID
-    x = g["x0"] + (k % g["cols"]) * (g["tw"] + g["gap"])
-    y = g["y0"] + (k // g["cols"]) * (g["th"] + g["gap"])
+    if n <= 3:                      # short sheet: one row, centred, taller tiles
+        tw = (292 - (n - 1) * g["gap"]) / max(n, 1)
+        x = g["x0"] + slot * (tw + g["gap"])
+        return (x, 70, x + tw, 186)
+    x = g["x0"] + (slot % g["cols"]) * (g["tw"] + g["gap"])
+    y = g["y0"] + (slot // g["cols"]) * (g["th"] + g["gap"])
     return (x, y, x + g["tw"], y + g["th"])
 
 
-def menu_hit(x, y):
-    """Touch hit-test: tile index, 'close', or None."""
-    if MENU_CLOSE[0] <= x <= MENU_CLOSE[2] and MENU_CLOSE[1] <= y <= MENU_CLOSE[3]:
+def menu_hit(x, y, items):
+    """Touch hit-test: item index, 'close', or None."""
+    inside = lambda b, p=3: b[0] - p <= x <= b[2] + p and b[1] - p <= y <= b[3] + p
+    if inside(MENU_CLOSE, 0):
         return "close"
-    for k in range(MENU_GRID["cols"] * MENU_GRID["rows"]):
-        x0, y0, x1, y1 = menu_tile_box(k)
-        if x0 - 3 <= x <= x1 + 3 and y0 - 3 <= y <= y1 + 3:
+    for k, it in enumerate(items):
+        if it.get("header") and inside(MENU_PILL):
+            return k
+    tiles = _tile_items(items)
+    for slot, k in enumerate(tiles):
+        if inside(menu_tile_box(slot, len(tiles))):
             return k
     return None
 
@@ -637,14 +669,26 @@ def menu_hit(x, y):
 def ov_menu(im, menu):
     im = dim(im, 0.45)
     d = frosted(im, (6, 6, 314, 234), r=18)
-    d.text(s(20, 24), menu.get("title", "Menu"), font=F("Bold", 15, True), fill=WHITE, anchor="lm")
+    items = menu["items"]
+    d.text(s(20, 24), fit(d, menu.get("title", "Menu"), F("Bold", 15, True), 150), font=F("Bold", 15, True),
+           fill=WHITE, anchor="lm")
     cx, cy = 290, 24
     d.ellipse(s(cx - 11, cy - 11, cx + 11, cy + 11), fill=(255, 255, 255, 30))
     d.line(s(cx - 4, cy - 4, cx + 4, cy + 4), fill=T1, width=int(1.6 * SS))
     d.line(s(cx - 4, cy + 4, cx + 4, cy - 4), fill=T1, width=int(1.6 * SS))
-    for k, it in enumerate(menu["items"]):
-        x0, y0, x1, y1 = menu_tile_box(k)
+    if menu.get("subtitle"):
+        d.text(s(160, 52), fit(d, menu["subtitle"], F("Medium", 11), 280), font=F("Medium", 11), fill=T2, anchor="mm")
+    tiles = _tile_items(items)
+    for k, it in enumerate(items):
         sel = k == menu.get("sel")
+        if it.get("header"):
+            x0, y0, x1, y1 = MENU_PILL
+            d.rounded_rectangle(s(*MENU_PILL), 14 * SS, fill=SEL_FILL if sel else (255, 255, 255, 30),
+                                outline=(255, 255, 255, 230) if sel else GLASS_LINE, width=SS)
+            d.text(s(x0 + 14, (y0 + y1) / 2), "?", font=F("Bold", 12, True), fill=T1, anchor="mm")
+            d.text(s(x0 + 26, (y0 + y1) / 2), it["label"], font=F("SemiBold", 10), fill=T1, anchor="lm")
+            continue
+        x0, y0, x1, y1 = menu_tile_box(tiles.index(k), len(tiles))
         enabled = it.get("enabled", True)
         glass(d, (x0, y0, x1, y1), 12, fill=SEL_FILL if sel else GLASS_FILL,
               line=(255, 255, 255, 230) if sel else GLASS_LINE)
@@ -660,6 +704,171 @@ def ov_menu(im, menu):
             fill = (RED + (255,)) if it.get("confirming") else (T1 if enabled else T3)
             d.text(s(x0 + 10, ly), ln, font=lf, fill=fill, anchor="lm")
             ly += 15
+    return im
+
+
+# ---------------------------------------------------------------- phones
+PHONE_ROWS = dict(y0=56, h=40, gap=4, n=4)
+
+
+def phone_window(n_dev, sel):
+    """First row index shown, so the selection stays visible."""
+    n = PHONE_ROWS["n"]
+    return max(0, min(sel - n + 1 if sel >= n else 0, max(0, n_dev - n)))
+
+
+def phones_hit(x, y, n_dev, sel):
+    r = PHONE_ROWS
+    if y < r["y0"]:
+        return None
+    k = int((y - r["y0"]) // (r["h"] + r["gap"]))
+    i = phone_window(n_dev, sel) + k
+    return i if 0 <= k < r["n"] and i < n_dev else None
+
+
+def scr_phones(m):
+    im = brand_bg()
+    d = ImageDraw.Draw(im, "RGBA")
+    status(d, m)
+    devs, sel = m.get("phones") or [], m.get("phone_sel", 0)
+    d.text(s(14, 44), "Phones", font=F("Bold", 15, True), fill=WHITE, anchor="lm")
+    d.text(s(306, 44), f"{len(devs)} paired" if devs else "", font=F("SemiBold", 10), fill=T2, anchor="rm")
+    if not devs:
+        glass(d, (12, 60, 308, 226))
+        d.text(s(160, 120), "No phones paired yet", font=F("SemiBold", 14), fill=T1, anchor="mm")
+        d.text(s(160, 144), "Pick this speaker in your phone's Bluetooth list", font=F("Medium", 10),
+               fill=T2, anchor="mm")
+        return im
+    r, now = PHONE_ROWS, m.get("now_wall", 0)
+    first = phone_window(len(devs), sel)
+    for k, dev in enumerate(devs[first:first + r["n"]]):
+        i = first + k
+        y0 = r["y0"] + k * (r["h"] + r["gap"])
+        y1 = y0 + r["h"]
+        on = i == sel and m.get("phone_focus")
+        glass(d, (12, y0, 308, y1), 12, fill=SEL_FILL if on else GLASS_FILL,
+              line=(255, 255, 255, 230) if on else GLASS_LINE)
+        cy = (y0 + y1) / 2
+        d.ellipse(s(22, cy - 13, 48, cy + 13), fill=(BLUE + (255,)) if dev["connected"] else (255, 255, 255, 34))
+        bt_glyph(d, 35, cy, 13, WHITE if dev["connected"] else T2, 2)
+        d.text(s(58, cy - 8), fit(d, dev["name"], F("SemiBold", 13), 170), font=F("SemiBold", 13), fill=WHITE,
+               anchor="lm")
+        if dev.get("blocked"):
+            mins = max(1, int((dev.get("blocked_until", 0) - now + 59) // 60)) if dev.get("blocked_until") else 0
+            sub, col = (f"Blocked · {mins} min" if mins else "Blocked"), AMBER + (255,)
+        elif dev["connected"]:
+            sub, col = ("Connected · playing" if m.get("playing") and m.get("source") == "Bluetooth"
+                        else "Connected"), (120, 180, 255, 255)
+        else:
+            sub, col = "Paired", T3
+        d.text(s(58, cy + 9), sub, font=F("Medium", 10), fill=col, anchor="lm")
+        d.text(s(296, cy), "›", font=F("SemiBold", 18), fill=T3, anchor="rm")
+    if len(devs) > r["n"]:                     # scroll hint
+        frac = first / (len(devs) - r["n"])
+        d.rounded_rectangle(s(311, 58 + 150 * frac, 313, 58 + 150 * frac + 18), SS, fill=T3)
+    return im
+
+
+# ---------------------------------------------------------------- join (QR codes)
+def _qr(data, px_max):
+    """QR code as a crisp image with integer pixels per module (pasted after downscaling)."""
+    try:
+        import qrcode
+    except ImportError:
+        return None
+    q = qrcode.QRCode(border=2, error_correction=qrcode.constants.ERROR_CORRECT_L)
+    q.add_data(data)
+    q.make(fit=True)
+    mat = q.get_matrix()
+    n = len(mat)
+    px = max(2, px_max // n)
+    img = Image.new("L", (n, n), 255)
+    img.putdata([0 if c else 255 for row in mat for c in row])
+    return img.resize((n * px, n * px), Image.Resampling.NEAREST).convert("RGB")
+
+
+def _wifi_qr_string(ssid, psk):
+    esc = lambda v: "".join("\\" + c if c in '\\;,:"' else c for c in v)
+    return f"WIFI:T:{'WPA' if psk else 'nopass'};S:{esc(ssid)};" + (f"P:{esc(psk)};" if psk else "") + ";"
+
+
+def scr_join(m, pastes):
+    im = brand_bg()
+    d = ImageDraw.Draw(im, "RGBA")
+    status(d, m)
+    j = m.get("join") or {}
+    cards = []
+    if j.get("ssid"):
+        cards.append(("Speaker hotspot" if j.get("hotspot") else "Join Wi-Fi", j["ssid"],
+                      _wifi_qr_string(j["ssid"], j.get("psk", "")) if j.get("psk") is not None else None,
+                      "Then pick AirPlay"))
+    else:
+        cards.append(("Wi-Fi", "Not connected", None, ""))
+    url = f"http://{j['ip']}/" if j.get("ip") else None
+    cards.append(("Open moOde", j.get("host") or j.get("ip") or "--", url, j.get("ip", "")))
+    for c, (lab, val, data, note) in enumerate(cards):
+        x0 = 12 + c * 152
+        glass(d, (x0, 32, x0 + 144, 226))
+        qr = _qr(data, 112) if data else None
+        if qr:
+            q = qr.size[0]
+            qx, qy = x0 + (144 - q) / 2, 40 + (114 - q) / 2
+            d.rounded_rectangle(s(qx - 5, qy - 5, qx + q + 5, qy + q + 5), 8 * SS, fill=WHITE)
+            pastes.append((qr, (int(round(qx)), int(round(qy)))))
+        else:
+            d.rounded_rectangle(s(x0 + 16, 40, x0 + 128, 152), 10 * SS, fill=(255, 255, 255, 18))
+            wifi_bars(d, x0 + 62, 104, 0, T3)
+            d.text(s(x0 + 72, 126), "No details", font=F("Medium", 10), fill=T3, anchor="mm")
+        d.text(s(x0 + 12, 170), lab, font=F("Medium", 10), fill=T2, anchor="lm")
+        d.text(s(x0 + 12, 189), fit(d, val, F("Bold", 14, True), 122), font=F("Bold", 14, True), fill=WHITE,
+               anchor="lm")
+        if note:
+            d.text(s(x0 + 12, 209), fit(d, note, F("Medium", 9), 122), font=F("Medium", 9), fill=T3, anchor="lm")
+    return im
+
+
+# ---------------------------------------------------------------- session stats
+def scr_stats(m):
+    im = brand_bg()
+    d = ImageDraw.Draw(im, "RGBA")
+    status(d, m)
+    st = m.get("stats") or {}
+    hist = st.get("hist") or []                  # [(seconds_ago, amps)], oldest first
+    glass(d, (12, 32, 308, 140))
+    d.text(s(24, 46), "Current draw", font=F("Medium", 10), fill=T2, anchor="lm")
+    gx0, gx1, gy0, gy1 = 24, 296, 60, 128
+    if len(hist) >= 2:
+        span = max(hist[0][0], 600)                  # at least 10 minutes wide
+        top = max(1.0, max(a for _, a in hist) * 1.15)
+        top = math.ceil(top)
+        for frac in (0.5, 1.0):                          # recessive grid
+            y = gy1 - (gy1 - gy0) * frac
+            d.line(s(gx0, y, gx1, y), fill=(255, 255, 255, 22), width=SS)
+        d.text(s(296, 46), f"scale 0–{top} A", font=F("Medium", 9), fill=T3, anchor="rm")
+        pts = [(gx1 - (gx1 - gx0) * ago / span, gy1 - (gy1 - gy0) * max(0.0, a) / top) for ago, a in hist]
+        d.polygon([s(*p) for p in [(pts[0][0], gy1)] + pts + [(pts[-1][0], gy1)]], fill=(255, 255, 255, 30))
+        d.line([s(*p) for p in pts], fill=WHITE, width=2 * SS, joint="curve")
+        lx, ly = pts[-1]
+        d.ellipse(s(lx - 3, ly - 3, lx + 3, ly + 3), fill=WHITE)
+        d.text(s(gx0, 136), f"-{fmt_uptime(span)}", font=F("Medium", 9), fill=T3, anchor="lm")
+        d.text(s(gx1, 136), "now", font=F("Medium", 9), fill=T3, anchor="rm")
+    else:
+        d.text(s(160, 94), "Collecting…", font=F("Medium", 11), fill=T3, anchor="mm")
+    used = st.get("used_ah", 0.0)
+    tiles = [("On for", fmt_uptime(st.get("uptime", 0))),
+             ("Used", f"{used:.2f} Ah"),
+             ("Avg draw", f"{st.get('avg', 0):.2f} A"),
+             ("Peak", f"{st.get('peak', 0):.1f} A")]
+    for k, (lab, val) in enumerate(tiles):
+        x = 12 + k * 75
+        glass(d, (x, 146, x + 71, 226), 12)
+        d.text(s(x + 10, 162), lab, font=F("Medium", 10), fill=T2, anchor="lm")
+        vf = F("Bold", 14, True)
+        if d.textlength(val, font=vf) > 56 * SS:
+            vf = F("Bold", 11, True)
+        d.text(s(x + 10, 206), val, font=vf, fill=WHITE, anchor="lm")
+    if st.get("used_pct") is not None:
+        d.text(s(22 + 75, 218), f"{st['used_pct']:.0f}% of pack", font=F("Medium", 8), fill=T3, anchor="lm")
     return im
 
 
@@ -687,6 +896,7 @@ def ov_help(im, touch):
 # ---------------------------------------------------------------- entry point
 def render(m):
     """m: snapshot dict from display.py. Returns a 320x240 RGB image."""
+    pastes = []            # crisp images (QR codes) placed after the downscale
     if m.get("splash_kind"):
         im = scr_splash(m)
     else:
@@ -696,6 +906,12 @@ def render(m):
         m = dict(m, _overlay_bottom=bool(pairing or vol))
         if view == "battery":
             im = scr_battery(m)
+        elif view == "stats":
+            im = scr_stats(m)
+        elif view == "phones":
+            im = scr_phones(m)
+        elif view == "join":
+            im = scr_join(m, pastes)
         elif view == "system":
             im = scr_system(m)
         elif m.get("source"):
@@ -712,4 +928,8 @@ def render(m):
             im = ov_menu(im, m["menu"])
         if m.get("help"):
             im = ov_help(im, m.get("touch"))
-    return im.resize((W, H), Image.Resampling.LANCZOS)
+    out = im.resize((W, H), Image.Resampling.LANCZOS)
+    if not (m.get("menu") or m.get("help") or m.get("popup")):
+        for img, xy in pastes:
+            out.paste(img, xy)
+    return out

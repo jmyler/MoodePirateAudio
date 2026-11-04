@@ -9,6 +9,7 @@ bench control pipe (`echo press > ctl`) for testing without hardware.
             hold = menu (disconnect phone, add a phone, screens, controls help)
     Touch:  tap = play/pause, swipe = change screen, tap top bar = menu
 """
+import collections
 import logging
 import os
 import signal
@@ -57,12 +58,19 @@ VOL_STEP = 2               # per knob detent
 VOL_MAX = 100              # cap, e.g. 85 so a borrowed phone can't run it flat out
 VOL_SH = "/var/www/util/vol.sh"
 
+# Join screen: the Wi-Fi QR code uses the password NetworkManager has stored.
+# Set this to override it (or "" for an open network); None = read it from the Pi.
+WIFI_QR_PSK = None
+
 # Behaviour
 PAIR_S = 120               # "Add a phone" window while someone is connected
 POPUP_S = 4
 VOL_SHOW_S = 1.6
 MENU_TIMEOUT_S = 15
 HOT_C = 75                 # CPU temperature warning
+HIST_BUCKET_S = 30         # session graph: one point per 30 s ...
+HIST_POINTS = 480          # ... for the last 4 hours
+VIEW_TIMEOUT_S = 60        # info screens go back to now playing after this long untouched
 
 # Backlight: full while playing; dims when nothing's happening
 BRIGHT_FULL = 1.0
@@ -103,6 +111,12 @@ class State:
         self.bt_visible = False
         self.touch = False
         self.activity = time.monotonic()
+        self.last_input = time.monotonic()
+        self.phones = []               # paired phones (btctl.devices())
+        self.phone_sel = 0
+        self.phone_focus = False       # knob has moved the highlight on the Phones screen
+        self.join = {}                 # Wi-Fi / moOde details for the QR codes
+        self.stats = {}                # session stats
 
     def set(self, **kw):
         changed = False
@@ -121,7 +135,7 @@ class State:
 
 
 S = State()
-VIEWS = ("now", "battery", "system")
+VIEWS = ("now", "battery", "stats", "phones", "join", "system")
 
 
 def popup(icon, color, small, big, note="", secs=POPUP_S, **kw):
@@ -257,6 +271,23 @@ def kick():
         popup("bt_off", (255, 255, 255), "Nothing connected", "—", icon_alpha=40)
 
 
+class _Suppress:
+    """Set of names that expires: skip the generic 'Disconnected' popup for ~10 s."""
+    def __init__(self):
+        self.d = {}
+
+    def add(self, name):
+        if name:
+            self.d[name] = time.monotonic() + 10
+
+    def update(self, names):
+        for n in names:
+            self.add(n)
+
+    def __contains__(self, name):
+        return self.d.get(name, 0) > time.monotonic()
+
+
 class ConnWatcher(threading.Thread):
     """Connect/disconnect popups, and the Bluetooth-first visibility rule:
     discoverable whenever nothing is connected or playing, hidden otherwise
@@ -266,9 +297,10 @@ class ConnWatcher(threading.Thread):
     def __init__(self):
         super().__init__(name="conn")
         self.known = None
-        self.suppress = set()
+        self.suppress = _Suppress()      # names we just disconnected ourselves (own popup shown)
         self.visible = None
         self.last_assert = 0
+        self.refresh = threading.Event()
 
     def run(self):
         import btctl
@@ -286,8 +318,8 @@ class ConnWatcher(threading.Thread):
                         if mac not in now and name not in self.suppress:
                             log.info("disconnected: %s (%s)", name, mac)
                             popup("bt_off", (255, 255, 255), "Disconnected", name, icon_alpha=40)
-                    self.suppress.clear()
                 self.known = now
+                S.set(phones=btctl.devices())
                 want = (not now and S.source is None) or S.pairing_until > time.monotonic()
                 if want != self.visible or time.monotonic() - self.last_assert > 60:
                     btctl.set_visible(want)
@@ -295,7 +327,8 @@ class ConnWatcher(threading.Thread):
                     S.set(bt_visible=want)
             except Exception as e:
                 log.debug("conn watch: %s", e)
-            time.sleep(2)
+            self.refresh.wait(2)
+            self.refresh.clear()
 
 
 CONN = ConnWatcher()
@@ -313,6 +346,12 @@ class BatteryThread(threading.Thread):
         self.peak = 0.0
         self.alerted = set()
         self.was_charging = False
+        # session stats (since this program started, i.e. since power-on in normal use)
+        self.t0 = time.monotonic()
+        self.used_ah = 0.0
+        self.hist = collections.deque(maxlen=HIST_POINTS)     # (monotonic, avg amps) per bucket
+        self._bucket = [0.0, 0, time.monotonic()]             # sum, count, start
+        self._last_t = None
 
     def alerts(self, soc, charging):
         pct = soc * 100
@@ -336,6 +375,15 @@ class BatteryThread(threading.Thread):
                 self.g.update(v, i)
                 self.peak = max(self.peak, i)
                 now = time.monotonic()
+                if self._last_t is not None and i > 0:
+                    self.used_ah += i * (now - self._last_t) / 3600
+                self._last_t = now
+                b = self._bucket
+                b[0] += max(i, 0.0)
+                b[1] += 1
+                if now - b[2] >= HIST_BUCKET_S:
+                    self.hist.append((now, b[0] / b[1]))
+                    self._bucket = [0.0, 0, now]
                 if now - last_push >= 2:
                     last_push = now
                     charging = i < -0.1 and v > 2.5 * CELLS
@@ -344,6 +392,14 @@ class BatteryThread(threading.Thread):
                     S.set(batt=dict(v=v, i=i, soc=soc, hrs=self.g.hours_left, synced=self.g.synced,
                                     peak=self.peak, avg=self.g.avg_draw, charging=charging, full_hrs=full))
                     self.alerts(soc, charging)
+                    run_h = (now - self.t0) / 3600
+                    hist = [(now - ts, a) for ts, a in self.hist]
+                    if self._bucket[1]:
+                        hist.append((0.0, self._bucket[0] / self._bucket[1]))
+                    S.set(stats=dict(uptime=now - self.t0, used_ah=self.used_ah,
+                                     used_pct=100 * self.used_ah / CAPACITY_AH,
+                                     avg=self.used_ah / run_h if run_h > 0.01 else max(i, 0.0),
+                                     peak=self.peak, hist=hist))
             except OSError as e:
                 log.warning("INA226 read: %s", e)
                 time.sleep(2)
@@ -364,6 +420,26 @@ class SysThread(threading.Thread):
             return subprocess.run(cmd, capture_output=True, text=True, timeout=3).stdout
         except (OSError, subprocess.TimeoutExpired):
             return ""
+
+    def _join(self, sy):
+        """SSID + password of the Wi-Fi the Pi is on (home network or its own hotspot), for the QR code.
+        NetworkManager only reveals the password to root, hence sudo -n."""
+        j = dict(ssid=sy.get("ssid", ""), hotspot=sy.get("hotspot"), ip=sy.get("ip"), host=sy.get("host"))
+        if not j["ssid"]:
+            return j
+        if WIFI_QR_PSK is not None:
+            j["psk"] = WIFI_QR_PSK
+            return j
+        name = ""
+        for ln in self._out(["nmcli", "-t", "-f", "NAME,DEVICE", "connection", "show", "--active"]).splitlines():
+            n, _, dev = ln.rpartition(":")
+            if dev == "wlan0":
+                name = n.replace("\\:", ":")
+        if name:
+            psk = self._out(["sudo", "-n", "nmcli", "-s", "-g", "802-11-wireless-security.psk",
+                             "connection", "show", name]).strip()
+            j["psk"] = psk          # "" = open network
+        return j
 
     def _warn(self, key, *args, **kw):
         if time.monotonic() - self.warned.get(key, -1e9) > 600:
@@ -390,7 +466,7 @@ class SysThread(threading.Thread):
                     sy["uptime"] = float(f.read().split()[0])
             except OSError:
                 pass
-            if S.view == "system" or time.monotonic() - last_net > 60:
+            if S.view in ("system", "join") or time.monotonic() - last_net > 60:
                 last_net = time.monotonic()
                 info = self._out(["iw", "dev", "wlan0", "info"])
                 sy["hotspot"] = "type AP" in info
@@ -407,6 +483,7 @@ class SysThread(threading.Thread):
                 ips = self._out(["hostname", "-I"]).split()
                 sy["ip"] = ips[0] if ips else ""
                 sy["host"] = socket.gethostname() + ".local"
+                S.set(join=self._join(sy))
             S.set(sys=sy)
             if sy.get("temp") and sy["temp"] >= HOT_C:
                 self._warn("hot", "warn", ui.AMBER, "Running hot", f"{sy['temp']:.0f}°C", "Shade the box or open the lid")
@@ -416,8 +493,13 @@ class SysThread(threading.Thread):
 
 
 # ------------------------------------------------------------------ menu
+def _view_tile(m, view, icon, label):
+    here = m.get("view", "now") == view
+    return dict(id="view", view=view, icon="music" if here else icon, label="Now playing" if here else label)
+
+
 def menu_items(m):
-    """Menu tiles for the current state (also used by preview.py)."""
+    """Main menu for the current state (also used by preview.py)."""
     items = []
     if m.get("source") == "Bluetooth" and m.get("device"):
         items.append(dict(id="kick", icon="bt_off", color=ui.RED, label=f"Disconnect {m['device']}",
@@ -426,46 +508,96 @@ def menu_items(m):
         items.append(dict(id="kick", icon="bt_off", color=ui.RED, label="Stop AirPlay", confirm="Confirm stop"))
     else:
         items.append(dict(id="kick", icon="bt_off", label="No phone connected", enabled=False))
-    pairing = (m.get("pairing_left") or 0) and True
+    pairing = bool(m.get("pairing_left"))
     items.append(dict(id="pair", icon="plus", color=ui.BLUE, label="Stop pairing" if pairing else "Add a phone"))
-    items.append(dict(id="next", icon="next", label="Next track", enabled=bool(m.get("source"))))
-    view = m.get("view", "now")
-    items.append(dict(id="battery", icon="music" if view == "battery" else "battery",
-                      label="Now playing" if view == "battery" else "Battery"))
-    items.append(dict(id="system", icon="music" if view == "system" else "system",
-                      label="Now playing" if view == "system" else "System"))
-    items.append(dict(id="help", icon="help", label="Controls"))
+    items.append(_view_tile(m, "phones", "phone", "Phones"))
+    items.append(_view_tile(m, "join", "qr", "Join Wi-Fi"))
+    items.append(_view_tile(m, "battery", "battery", "Battery"))
+    items.append(_view_tile(m, "system", "system", "System"))
+    items.append(dict(id="help", label="Controls", header=True))
     return items
 
 
+def phone_items(dev):
+    """Action sheet for one paired phone."""
+    items = []
+    if dev.get("connected"):
+        items.append(dict(id="disconnect", icon="bt_off", color=ui.RED, label="Disconnect",
+                          confirm="Confirm disconnect"))
+    elif dev.get("blocked"):
+        items.append(dict(id="unblock", icon="bt", color=ui.BLUE, label="Unblock now"))
+    items.append(dict(id="forget", icon="x", color=ui.RED, label="Forget phone", confirm="Confirm forget"))
+    items.append(dict(id="cancel", icon="x", label="Cancel"))
+    return items
+
+
+def _phone(mac):
+    return next((p for p in S.phones if p["mac"] == mac), None)
+
+
+def current_menu_items(m=None):
+    menu = S.menu or {}
+    if menu.get("kind") == "phone":
+        dev = _phone(menu.get("mac"))
+        return phone_items(dev) if dev else [dict(id="cancel", icon="x", label="Cancel")]
+    return menu_items(m if m is not None else snapshot(with_menu=False))
+
+
+def _bt(fn, *args):
+    def run():
+        try:
+            import btctl
+            getattr(btctl, fn)(*args)
+            CONN.refresh.set()
+        except Exception as e:
+            log.warning("bluetooth %s: %s", fn, e)
+    threading.Thread(target=run, daemon=True).start()
+
+
 def _menu_select(k):
-    snap = snapshot()
-    items = menu_items(snap)
+    items = current_menu_items()
     if not (0 <= k < len(items)) or not items[k].get("enabled", True):
         return
     it = items[k]
-    if it["id"] == "kick":
-        if S.menu.get("confirm_until", 0) < time.monotonic():     # first press arms it
-            S.menu["confirm_until"] = time.monotonic() + 3
-            S.menu["sel"] = k
-            S.dirty.set()
-            return
-        S.set(menu=None)
-        threading.Thread(target=kick, daemon=True).start()
+    if it.get("confirm") and S.menu.get("confirm_until", 0) < time.monotonic():   # first press arms it
+        S.menu["confirm_until"] = time.monotonic() + 3
+        S.menu["sel"] = k
+        S.dirty.set()
         return
+    menu = S.menu
     S.set(menu=None)
-    if it["id"] == "pair":
+    i = it["id"]
+    if i == "kick":
+        threading.Thread(target=kick, daemon=True).start()
+    elif i == "pair":
         end_pairing() if S.pairing_until > time.monotonic() else start_pairing()
-    elif it["id"] == "next":
-        next_track()
-    elif it["id"] in ("battery", "system"):
-        S.set(view="now" if S.view == it["id"] else it["id"])
-    elif it["id"] == "help":
+    elif i == "view":
+        S.set(view="now" if S.view == it["view"] else it["view"])
+    elif i == "help":
         S.set(help=True)
+    elif i == "disconnect":
+        dev = _phone(menu.get("mac")) or {}
+        CONN.suppress.add(dev.get("name", ""))
+        _bt("disconnect", menu["mac"])
+        popup("bt_off", (255, 255, 255), "Disconnected", dev.get("name", ""),
+              "Can't reconnect for 5 min", icon_alpha=40)
+    elif i == "unblock":
+        _bt("unblock", menu["mac"])
+    elif i == "forget":
+        dev = _phone(menu.get("mac")) or {}
+        CONN.suppress.add(dev.get("name", ""))
+        _bt("forget", menu["mac"])
+        popup("x", (255, 255, 255), "Forgotten", dev.get("name", ""), "It will need to pair again", icon_alpha=40)
 
 
 def open_menu():
-    S.set(menu=dict(sel=0, opened=time.monotonic(), confirm_until=0), help=False)
+    S.set(menu=dict(kind="main", sel=0, opened=time.monotonic(), confirm_until=0), help=False)
+
+
+def open_phone_sheet(i):
+    if 0 <= i < len(S.phones):
+        S.set(phone_sel=i, menu=dict(kind="phone", mac=S.phones[i]["mac"], sel=0,
+                                     opened=time.monotonic(), confirm_until=0), help=False)
 
 
 # ------------------------------------------------------------------ input handling
@@ -476,8 +608,12 @@ def handle(ev):
     kind = ev[0]
     asleep = SCREEN["bright"] <= 0.0
     S.poke()
+    S.last_input = time.monotonic()
     if asleep and kind in ("tap", "swipe", "touch_hold"):
         return                                   # first touch only wakes the screen
+    if kind == "turn" and not S.menu and not S.help and S.view == "phones" and S.phones:
+        S.set(phone_sel=(S.phone_sel + ev[1]) % len(S.phones), phone_focus=True)    # knob picks a phone
+        return
     if kind == "turn" and not S.menu:
         S.set(popup=None)                        # the volume bar takes over from any popup
         VOL.step(ev[1])
@@ -490,7 +626,8 @@ def handle(ev):
 
     if S.menu:
         S.menu["opened"] = time.monotonic()
-        n = len(menu_items(snapshot()))
+        items = current_menu_items()
+        n = len(items)
         if kind == "turn":
             S.menu["sel"] = (S.menu.get("sel", 0) + ev[1]) % n
             S.menu["confirm_until"] = 0
@@ -500,10 +637,10 @@ def handle(ev):
         elif kind in ("hold", "touch_hold"):
             S.set(menu=None)
         elif kind == "tap":
-            hit = ui.menu_hit(ev[1], ev[2])
+            hit = ui.menu_hit(ev[1], ev[2], items)
             if hit == "close":
                 S.set(menu=None)
-            elif hit is not None and hit < n:
+            elif hit is not None:
                 if hit != S.menu.get("sel"):
                     S.menu["confirm_until"] = 0
                 S.menu["sel"] = hit
@@ -513,6 +650,14 @@ def handle(ev):
     if kind == "tap" and S.popup and S.popup[1] > time.monotonic():
         S.set(popup=None)
         return
+    if S.view == "phones" and kind == "press" and S.phones:
+        open_phone_sheet(S.phone_sel)
+        return
+    if S.view == "phones" and kind == "tap" and ev[2] >= ui.STATUS_H:
+        hit = ui.phones_hit(ev[1], ev[2], len(S.phones), S.phone_sel)
+        if hit is not None:
+            open_phone_sheet(hit)
+        return
     if kind == "press":
         play_pause()
     elif kind == "double":
@@ -521,7 +666,7 @@ def handle(ev):
         open_menu()
     elif kind == "swipe" and ev[1] in ("left", "right"):
         i = VIEWS.index(S.view) if S.view in VIEWS else 0
-        S.set(view=VIEWS[(i + (1 if ev[1] == "left" else -1)) % len(VIEWS)])
+        S.set(view=VIEWS[(i + (1 if ev[1] == "left" else -1)) % len(VIEWS)], phone_focus=False)
     elif kind == "tap":
         if ev[2] < ui.STATUS_H:
             open_menu()
@@ -530,13 +675,15 @@ def handle(ev):
 
 
 # ------------------------------------------------------------------ rendering
-def snapshot():
+def snapshot(with_menu=True):
     now = time.monotonic()
     with S.lock:
         m = dict(source=S.source, device=S.device, playing=S.playing, title=S.title, artist=S.artist,
                  album=S.album, art=S.art, batt=S.batt, view=S.view, bt_name=S.bt_name,
                  airplay_name=S.airplay_name, bt_visible=S.bt_visible, inputs=S.inputs,
-                 sys=S.sys, touch=S.touch, t=now, help=S.help)
+                 sys=S.sys, touch=S.touch, t=now, help=S.help, phones=list(S.phones),
+                 phone_sel=min(S.phone_sel, max(0, len(S.phones) - 1)), phone_focus=S.phone_focus or S.touch,
+                 join=S.join, stats=S.stats, now_wall=time.time())
         if S.popup and S.popup[1] > now:
             m["popup"] = S.popup[0]
         if S.vol_show and S.vol_show[1] > now:
@@ -547,13 +694,21 @@ def snapshot():
         menu = S.menu
     if m["view"] == "now" and not m["source"] and (m["batt"] or {}).get("charging"):
         m["view"] = "battery"                    # idle + plugged in: show charging
-    if menu:
-        items = menu_items(m)
+    if menu and with_menu:
+        if menu.get("kind") == "phone":
+            dev = _phone(menu.get("mac")) or {}
+            items = current_menu_items(m)
+            title = dev.get("name", "Phone")
+            sub = ("Connected" if dev.get("connected") else "Blocked for a few minutes" if dev.get("blocked")
+                   else "Paired") if dev else "No longer paired"
+        else:
+            items = menu_items(m)
+            title = f"{m['device']} connected" if m.get("device") else (m.get("bt_name") or "Menu")
+            sub = ""
         sel = menu.get("sel", 0)
         if menu.get("confirm_until", 0) > now and 0 <= sel < len(items):
             items[sel]["confirming"] = True
-        title = f"{m['device']} connected" if m.get("device") else (m.get("bt_name") or "Menu")
-        m["menu"] = dict(items=items, sel=sel, title=title)
+        m["menu"] = dict(items=items, sel=sel, title=title, subtitle=sub)
     return m
 
 
@@ -682,6 +837,8 @@ def main():
             S.set(popup=None)
         if S.menu and m["t"] - S.menu.get("opened", 0) > MENU_TIMEOUT_S:
             S.set(menu=None)
+        if S.view != "now" and not S.menu and m["t"] - S.last_input > VIEW_TIMEOUT_S:
+            S.set(view="now", phone_focus=False)
         # anything new playing counts as activity (wakes a dimmed screen)
         key = (m["source"], m["title"], m["playing"], m["device"])
         if key != last_key:
