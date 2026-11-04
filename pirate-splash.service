@@ -1,0 +1,16 @@
+[Unit]
+Description=Speaker screen boot splash
+DefaultDependencies=no
+After=local-fs.target systemd-udevd.service
+Before=pirate-audio.service
+
+[Service]
+Type=oneshot
+User=__USER__
+SupplementaryGroups=spi gpio
+WorkingDirectory=__DIR__
+ExecStart=__DIR__/venv/bin/python __DIR__/splash.py
+TimeoutStartSec=20
+
+[Install]
+WantedBy=sysinit.target

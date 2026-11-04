@@ -81,6 +81,7 @@ class BatteryGauge:
         self.v = self.i = 0.0
         self._last = None
         self._full_since = self._empty_since = None
+        self._rest_since = None
         self._last_save = 0
         self._load()
 
@@ -106,8 +107,23 @@ class BatteryGauge:
     def update(self, v, i):
         now = time.monotonic()
         self.v, self.i = v, i
-        if self.remaining is None:  # first boot: rough guess from voltage
+        if v < 2.5 * self.cells:    # no battery on the sense input (or it's flat-dead): don't guess
+            self._last = None
+            self._rest_since = None
+            return
+        if self.remaining is None:  # first reading: rough guess from voltage
             self.remaining = soc_from_voltage(v / self.cells) * self.cap
+        if not self.synced:
+            # Until a full charge gives us a real 100%, re-guess from voltage whenever the
+            # pack is resting and the count has drifted far from what the voltage says.
+            if abs(i) < 0.2:
+                self._rest_since = self._rest_since or now
+                if now - self._rest_since > 20:
+                    guess = soc_from_voltage(v / self.cells) * self.cap
+                    if abs(guess - self.remaining) > 0.15 * self.cap:
+                        self.remaining = guess
+            else:
+                self._rest_since = None
         if self._last is not None:
             dt = now - self._last
             self.remaining -= i * dt / 3600.0

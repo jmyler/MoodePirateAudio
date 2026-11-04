@@ -1,48 +1,86 @@
 #!/usr/bin/env python3
-"""Pirate Audio (ST7789) now-playing + battery display for moOde.
+"""Now playing, battery and connection control for a moOde speaker.
 
-- Sources: follows moOde's own active-renderer flags (see sources.py):
-  AirPlay, Bluetooth, Spotify, other renderers, then MPD library/radio.
-- Battery: INA226 coulomb counter in a thread; status bar + idle screen.
-- Buttons: A = screen on/off, B = now playing <-> battery detail, X/Y = volume.
+Screens (ui.py draws them): now playing / idle, battery (charging), system.
+Controls (inputs.py): a rotary knob with push switch, the touch screen, and a
+bench control pipe (`echo press > ctl`) for testing without hardware.
+
+    Knob:   turn = volume, press = play/pause, press twice = next track,
+            hold = menu (disconnect phone, add a phone, screens, controls help)
+    Touch:  tap = play/pause, swipe = change screen, tap top bar = menu
 """
+import collections
 import logging
 import os
 import signal
+import socket
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
 
-from PIL import Image, ImageDraw, ImageFont
+import ui
 
 # ------------------------------------------------------------------ config
 HOME = os.path.dirname(os.path.abspath(__file__))
-LOGO = os.path.join(HOME, "jm_logo.jpeg")          # optional idle image
 STATE_FILE = os.path.join(HOME, "battery_state.json")
+SPLASH_CACHE = os.path.join(HOME, "splash.png")     # shown by splash.py early in boot
+CTL_FIFO = os.path.join(HOME, "ctl")                 # bench control: echo press > ctl
 
+# Battery (INA226)
 BATTERY_ENABLED = True
-CAPACITY_AH = 20.0        # <-- set to your Battery Hookup pack's capacity
-CELLS = 8                 # 25.6 V LiFePO4 = 8S
-SHUNT_OHMS = 0.002        # R002
-CURRENT_GAIN = 1.0        # trim against a clamp meter
-CURRENT_SIGN = 1          # -1 if discharge shows negative in ina_test.py
-LOW_PCT = 20
+CAPACITY_AH = 6.0          # Battery Hookup 25.6 V 6 Ah pack
+CELLS = 8                  # 25.6 V LiFePO4 = 8S
+SHUNT_OHMS = 0.002         # R002
+CURRENT_GAIN = 1.0         # trim against a clamp meter
+CURRENT_SIGN = 1           # -1 if discharge shows negative in ina_test.py
+LOW_ALERTS = (20, 10)      # % thresholds for the low-battery popup
 
-BUTTONS = {"A": 5, "B": 6, "X": 16, "Y": 24}     # older Pimoroni docs list Y as 20
-VOL_UP = ["/var/www/util/vol.sh", "-up", "2"]     # verify on your moOde version
-VOL_DN = ["/var/www/util/vol.sh", "-dn", "2"]
+# Screen
+PANEL = "waveshare2"       # Waveshare 2" 240x320, used landscape
+ROTATION = 90              # 90 or 270 - flip if the picture is upside down
+SCREEN_PINS = dict(port=0, cs=1, dc=9, backlight=13, rst=27)
 
-LONG_PRESS_S = 2.0        # hold this long for the long-press action
-PAIR_S = 120              # pairing-mode window
-PAIR_HINT = "Hold B to pair a new phone"
-HIDE_BY_DEFAULT = True    # not discoverable unless pairing mode is on
-TOAST_S = 4
+# Knob (rotary encoder with push switch). Not fitted on this build: the touch screen and the
+# phone do everything. To add one later, wire it to GPIO 5/6/16 and use dict(a=5, b=6, sw=16).
+KNOB = dict(a=None, b=None, sw=None)
+KNOB_REVERSE = False       # True if turning clockwise turns the volume down
+KNOB_HOLD_S = 1.0          # hold this long for the menu
+DOUBLE_S = 0.35            # second press within this = double press
 
-FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-FONT_B = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-W = H = 240
-ART = 160
+# Touch (Waveshare 2" capacitive touch module, CST816D on I2C 0x15)
+TOUCH = "auto"             # "auto" = use it if found, True, or False
+TOUCH_PINS = dict(int=4, rst=17)
+TOUCH_MAP = "rot90" if ROTATION == 90 else "rot270"     # see touch_test.py
+
+# Volume (moOde)
+VOL_STEP = 2               # per knob detent
+VOL_TOUCH_STEP = 5         # per tap on the screen's volume buttons
+CONTROLS_S = 5             # touch control bar hides after this long untouched
+VOL_MAX = 100              # cap, e.g. 85 so a borrowed phone can't run it flat out
+VOL_SH = "/var/www/util/vol.sh"
+
+# Join screen: the Wi-Fi QR code uses the password NetworkManager has stored.
+# Set this to override it (or "" for an open network); None = read it from the Pi.
+WIFI_QR_PSK = None
+
+# Behaviour
+PAIR_S = 120               # "Add a phone" window while someone is connected
+POPUP_S = 4
+VOL_SHOW_S = 1.6
+MENU_TIMEOUT_S = 15
+HOT_C = 75                 # CPU temperature warning
+HIST_BUCKET_S = 30         # session graph: one point per 30 s ...
+HIST_POINTS = 480          # ... for the last 4 hours
+VIEW_TIMEOUT_S = 60        # info screens go back to now playing after this long untouched
+
+# Backlight: full while playing; dims when nothing's happening
+BRIGHT_FULL = 1.0
+BRIGHT_DIM = 0.4
+DIM_PAUSED_S = 120         # connected but paused/stopped
+DIM_IDLE_S = 60            # nobody connected
+OFF_IDLE_S = 600           # backlight off when nobody's connected for this long
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("pirate")
@@ -53,22 +91,41 @@ class State:
     def __init__(self):
         self.lock = threading.Lock()
         self.dirty = threading.Event()
-        self.source = None            # "AirPlay" | "Bluetooth" | "Library" | ... | None
-        self.device = ""              # e.g. connected Bluetooth phone name
-        self.inputs = ()              # enabled renderers, for the idle screen
+        # playback (sources.py)
+        self.source = None
+        self.device = ""
+        self.inputs = ()
         self.playing = False
         self.title = self.artist = self.album = ""
         self.art = None
-        self.batt = None              # dict from battery thread
-        self.view = "now"             # "now" | "battery"
-        self.screen_on = True
-        self.toast = None             # (line1, line2, rgb, expires_monotonic)
+        self.airplay_name = ""
+        self.ready = False
+        # battery / system
+        self.batt = None
+        self.sys = {}
+        # UI
+        self.view = "now"
+        self.popup = None              # (dict, expires)
+        self.menu = None               # dict(sel, opened, confirm_until)
+        self.help = False
+        self.vol_show = None           # (level, expires)
         self.pairing_until = 0.0
-        self.bt_name = ""             # what phones see in their Bluetooth list
+        self.bt_name = ""
+        self.bt_visible = False
+        self.touch = False
+        self.activity = time.monotonic()
+        self.last_input = time.monotonic()
+        self.phones = []               # paired phones (btctl.devices())
+        self.phone_sel = 0
+        self.phone_focus = False       # knob has moved the highlight on the Phones screen
+        self.join = {}                 # Wi-Fi / moOde details for the QR codes
+        self.stats = {}                # session stats
+        self.controls_until = 0.0      # touch control bar on Now playing
+        self.vol_level = 0
 
     def set(self, **kw):
+        changed = False
         with self.lock:
-            changed = False
             for k, v in kw.items():
                 if getattr(self, k) is not v and getattr(self, k) != v:
                     setattr(self, k, v)
@@ -76,23 +133,197 @@ class State:
         if changed:
             self.dirty.set()
 
+    def poke(self):
+        """User did something: full brightness, redraw."""
+        self.activity = time.monotonic()
+        self.dirty.set()
+
 
 S = State()
+VIEWS = ("now", "battery", "stats", "phones", "join", "system")
 
 
-def toast(line1, line2="", color=(70, 140, 255), secs=TOAST_S):
-    S.set(toast=(line1, line2, color, time.monotonic() + secs))
+def popup(icon, color, small, big, note="", secs=POPUP_S, **kw):
+    S.set(popup=(dict(icon=icon, color=color, small=small, big=big, note=note, **kw), time.monotonic() + secs))
+    S.poke()
 
 
-# ------------------------------------------------------------------ connection watcher
+# ------------------------------------------------------------------ playback control
+def _run(cmd, timeout=5):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode == 0
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.warning("%s: %s", cmd[0], e)
+        return False
+
+
+_airplay_ctl = None     # D-Bus remote-control name for shairport-sync, once found
+
+
+def _airplay(cmd):
+    """shairport-sync's remote control (needs its D-Bus interface; not every build has it)."""
+    global _airplay_ctl
+    tries = [_airplay_ctl] if _airplay_ctl else [
+        ("org.gnome.ShairportSync", "/org/gnome/ShairportSync", "org.gnome.ShairportSync.RemoteControl"),
+        ("org.mpris.MediaPlayer2.ShairportSync", "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player")]
+    for name, path, iface in tries:
+        if _run(["sudo", "-n", "busctl", "--system", "call", name, path, iface, cmd], timeout=3):
+            _airplay_ctl = (name, path, iface)
+            return True
+    return False
+
+
+def play_pause():
+    src, playing = S.source, S.playing
+    import btctl
+    ok = False
+    if src == "Bluetooth":
+        ok = btctl.player("Pause" if playing else "Play")
+    elif src == "AirPlay":
+        ok = _airplay("PlayPause")
+    elif src in ("Library", "Radio"):
+        ok = _run(["mpc", "-q", "toggle"])
+    if ok:
+        S.set(playing=not playing)               # optimistic; sources.py confirms within a second
+    elif src:
+        popup("pause", (255, 255, 255), "Can't control", src, "Pause from the phone", icon_alpha=40)
+
+
+def prev_track():
+    src = S.source
+    import btctl
+    ok = False
+    if src == "Bluetooth":
+        ok = btctl.player("Previous")
+    elif src == "AirPlay":
+        ok = _airplay("Previous")
+    elif src in ("Library", "Radio"):
+        ok = _run(["mpc", "-q", "prev"])
+    if not ok and src:
+        popup("next", (255, 255, 255), "Can't go back", src, "Use the phone", icon_alpha=40)
+
+
+def next_track():
+    src = S.source
+    import btctl
+    ok = False
+    if src == "Bluetooth":
+        ok = btctl.player("Next")
+    elif src == "AirPlay":
+        ok = _airplay("Next")
+    elif src in ("Library", "Radio"):
+        ok = _run(["mpc", "-q", "next"])
+    if not ok and src:
+        popup("next", (255, 255, 255), "Can't skip", src, "Skip from the phone", icon_alpha=40)
+
+
+class Volume(threading.Thread):
+    """Knob turns move a target; one worker applies the latest value (vol.sh is slow-ish)."""
+    daemon = True
+
+    def __init__(self):
+        super().__init__(name="volume")
+        self.target = None
+        self.last_step = 0.0
+        self.cv = threading.Condition()
+
+    @staticmethod
+    def current():
+        try:
+            con = sqlite3.connect("file:/var/local/www/db/moode-sqlite3.db?mode=ro", uri=True, timeout=2)
+            try:
+                return int(con.execute("select value from cfg_system where param='volknob'").fetchone()[0])
+            finally:
+                con.close()
+        except Exception:
+            return 50
+
+    def step(self, n, size=VOL_STEP):
+        with self.cv:
+            recent = time.monotonic() - self.last_step < 3
+            base = self.target if (self.target is not None and recent) else self.current()
+            self.target = max(0, min(VOL_MAX, base + n * size))
+            level = self.target
+            self.last_step = time.monotonic()
+            self.cv.notify()
+        S.set(vol_level=level)
+        if not (S.controls_until > time.monotonic()):       # the control bar shows volume itself
+            S.set(vol_show=(level, time.monotonic() + VOL_SHOW_S))
+        S.poke()
+
+    def run(self):
+        applied = None
+        while True:
+            with self.cv:
+                while self.target == applied:
+                    self.cv.wait()
+                want = self.target
+            if not _run(["sudo", "-n", VOL_SH, str(want)]):
+                log.warning("volume: %s %s failed", VOL_SH, want)
+            applied = want
+
+
+VOL = Volume()
+
+
+# ------------------------------------------------------------------ Bluetooth visibility & pairing
+def end_pairing():
+    S.set(pairing_until=0.0)
+
+
+def start_pairing():
+    S.set(pairing_until=time.monotonic() + PAIR_S, bt_visible=True)
+    try:
+        import btctl
+        btctl.set_visible(True)
+    except Exception as e:
+        log.warning("pairing: %s", e)
+
+
+def kick():
+    import btctl
+    names = btctl.kick()
+    CONN.suppress.update(names)
+    if S.source == "AirPlay" and btctl.kick_airplay():
+        names.append("AirPlay")
+    if names:
+        popup("bt_off", (255, 255, 255), "Disconnected", ", ".join(names),
+              f"Can't reconnect for {btctl.HOLD_S // 60} min", icon_alpha=40)
+    else:
+        popup("bt_off", (255, 255, 255), "Nothing connected", "—", icon_alpha=40)
+
+
+class _Suppress:
+    """Set of names that expires: skip the generic 'Disconnected' popup for ~10 s."""
+    def __init__(self):
+        self.d = {}
+
+    def add(self, name):
+        if name:
+            self.d[name] = time.monotonic() + 10
+
+    def update(self, names):
+        for n in names:
+            self.add(n)
+
+    def __contains__(self, name):
+        return self.d.get(name, 0) > time.monotonic()
+
+
 class ConnWatcher(threading.Thread):
-    """Announce Bluetooth connects/disconnects on screen."""
+    """Connect/disconnect popups, and the Bluetooth-first visibility rule:
+    discoverable whenever nothing is connected or playing, hidden otherwise
+    (so nobody can grab the speaker mid-song), plus the "Add a phone" window."""
     daemon = True
 
     def __init__(self):
         super().__init__(name="conn")
         self.known = None
-        self.suppress = set()   # names we just kicked (their own toast already shown)
+        self.suppress = _Suppress()      # names we just disconnected ourselves (own popup shown)
+        self.visible = None
+        self.last_assert = 0
+        self.refresh = threading.Event()
 
     def run(self):
         import btctl
@@ -103,16 +334,24 @@ class ConnWatcher(threading.Thread):
                     for mac, name in now.items():
                         if mac not in self.known:
                             log.info("connected: %s (%s)", name, mac)
-                            toast("Connected", name)
+                            popup("bt", ui.BLUE, "Connected", name)
+                            if S.pairing_until > time.monotonic():
+                                end_pairing()
                     for mac, name in self.known.items():
                         if mac not in now and name not in self.suppress:
                             log.info("disconnected: %s (%s)", name, mac)
-                            toast("Disconnected", name, (150, 150, 150))
-                    self.suppress.clear()
+                            popup("bt_off", (255, 255, 255), "Disconnected", name, icon_alpha=40)
                 self.known = now
+                S.set(phones=btctl.devices())
+                want = (not now and S.source is None) or S.pairing_until > time.monotonic()
+                if want != self.visible or time.monotonic() - self.last_assert > 60:
+                    btctl.set_visible(want)
+                    self.visible, self.last_assert = want, time.monotonic()
+                    S.set(bt_visible=want)
             except Exception as e:
                 log.debug("conn watch: %s", e)
-            time.sleep(2)
+            self.refresh.wait(2)
+            self.refresh.clear()
 
 
 CONN = ConnWatcher()
@@ -128,6 +367,28 @@ class BatteryThread(threading.Thread):
         self.ina = INA226(shunt_ohms=SHUNT_OHMS, current_gain=CURRENT_GAIN, sign=CURRENT_SIGN)
         self.g = BatteryGauge(CAPACITY_AH, CELLS, STATE_FILE)
         self.peak = 0.0
+        self.alerted = set()
+        self.was_charging = False
+        # session stats (since this program started, i.e. since power-on in normal use)
+        self.t0 = time.monotonic()
+        self.used_ah = 0.0
+        self.hist = collections.deque(maxlen=HIST_POINTS)     # (monotonic, avg amps) per bucket
+        self._bucket = [0.0, 0, time.monotonic()]             # sum, count, start
+        self._last_t = None
+
+    def alerts(self, soc, charging):
+        pct = soc * 100
+        for th in LOW_ALERTS:
+            if charging or pct > th + 5:
+                self.alerted.discard(th)
+            elif pct <= th and th not in self.alerted:
+                self.alerted.update(t for t in LOW_ALERTS if t >= th)
+                left = ui.fmt_dur(self.g.hours_left)
+                popup("battery", ui.RED if th <= 10 else ui.AMBER, "Battery low",
+                      f"{round(pct)}%" + (f" · ~{left}" if left else ""), "Plug in the charger", secs=8)
+        if self.was_charging and not charging and pct >= 99:
+            popup("bolt", ui.GREEN, "Battery", "Fully charged")
+        self.was_charging = charging
 
     def run(self):
         last_push = 0
@@ -137,254 +398,421 @@ class BatteryThread(threading.Thread):
                 self.g.update(v, i)
                 self.peak = max(self.peak, i)
                 now = time.monotonic()
+                if self._last_t is not None and i > 0:
+                    self.used_ah += i * (now - self._last_t) / 3600
+                self._last_t = now
+                b = self._bucket
+                b[0] += max(i, 0.0)
+                b[1] += 1
+                if now - b[2] >= HIST_BUCKET_S:
+                    self.hist.append((now, b[0] / b[1]))
+                    self._bucket = [0.0, 0, now]
                 if now - last_push >= 2:
                     last_push = now
-                    S.set(batt=dict(v=v, i=i, soc=self.g.soc, hrs=self.g.hours_left,
-                                    synced=self.g.synced, peak=self.peak, avg=self.g.avg_draw))
+                    charging = i < -0.1 and v > 2.5 * CELLS
+                    soc = self.g.soc
+                    full = ((1 - soc) * CAPACITY_AH / -i) if charging else None
+                    S.set(batt=dict(v=v, i=i, soc=soc, hrs=self.g.hours_left, synced=self.g.synced,
+                                    peak=self.peak, avg=self.g.avg_draw, charging=charging, full_hrs=full))
+                    self.alerts(soc, charging)
+                    run_h = (now - self.t0) / 3600
+                    hist = [(now - ts, a) for ts, a in self.hist]
+                    if self._bucket[1]:
+                        hist.append((0.0, self._bucket[0] / self._bucket[1]))
+                    S.set(stats=dict(uptime=now - self.t0, used_ah=self.used_ah,
+                                     used_pct=100 * self.used_ah / CAPACITY_AH,
+                                     avg=self.used_ah / run_h if run_h > 0.01 else max(i, 0.0),
+                                     peak=self.peak, hist=hist))
             except OSError as e:
                 log.warning("INA226 read: %s", e)
                 time.sleep(2)
             time.sleep(0.5)
 
 
-# ------------------------------------------------------------------ rendering
-def font(size, bold=False):
-    return ImageFont.truetype(FONT_B if bold else FONT, size)
+# ------------------------------------------------------------------ system health
+class SysThread(threading.Thread):
+    daemon = True
 
+    def __init__(self):
+        super().__init__(name="system")
+        self.warned = {}
 
-F_SM, F_MD, F_LG, F_XL = font(14), font(18), font(20, True), font(56, True)
-LOGO_IMG = None
-if os.path.exists(LOGO):
-    try:
-        LOGO_IMG = Image.open(LOGO).convert("RGB").resize((W, H), Image.Resampling.LANCZOS)
-    except Exception:
-        pass
-
-
-SOURCE_ICON = {}   # room for per-source glyphs later
-
-
-def fit(draw, text, f, width):
-    if draw.textlength(text, font=f) <= width:
-        return text
-    while text and draw.textlength(text + "…", font=f) > width:
-        text = text[:-1]
-    return text + "…"
-
-
-def batt_color(b):
-    return (230, 60, 50) if b["soc"] * 100 <= LOW_PCT else (80, 200, 110)
-
-
-def fmt_hrs(h):
-    if h is None:
-        return ""
-    return f"{int(h)}h{int((h % 1) * 60):02d}" if h < 100 else ">99h"
-
-
-def draw_status(d, b):
-    if not b:
-        return
-    pct = round(b["soc"] * 100)
-    col = batt_color(b)
-    # icon
-    d.rectangle((6, 6, 38, 20), outline=(200, 200, 200), width=2)
-    d.rectangle((39, 10, 42, 16), fill=(200, 200, 200))
-    d.rectangle((9, 9, 9 + int(26 * b["soc"]), 17), fill=col)
-    txt = f"{'' if b['synced'] else '~'}{pct}%"
-    if b["i"] < -0.1:
-        txt += " ⚡"
-    d.text((48, 4), txt, font=F_MD, fill=(235, 235, 235))
-    right = fmt_hrs(b["hrs"])
-    if right:
-        d.text((W - 6 - d.textlength(right, font=F_MD), 4), right, font=F_MD, fill=(170, 170, 170))
-
-
-def render():
-    with S.lock:
-        src, playing, title, artist, art = S.source, S.playing, S.title, S.artist, S.art
-        b, view, device, inputs = S.batt, S.view, S.device, S.inputs
-        tst, pair_until, bt_name = S.toast, S.pairing_until, S.bt_name
-    img = Image.new("RGB", (W, H), (0, 0, 0))
-    d = ImageDraw.Draw(img)
-    now = time.monotonic()
-
-    if tst and now < tst[3]:
-        l1, l2, col, _ = tst
-        d.rectangle((0, 0, W - 1, H - 1), outline=col, width=4)
-        d.text(((W - d.textlength(l1, font=F_LG)) / 2, 80), l1, font=F_LG, fill=col)
-        l2 = fit(d, l2, F_LG, W - 20)
-        d.text(((W - d.textlength(l2, font=F_LG)) / 2, 120), l2, font=F_LG, fill="white")
-        return img
-    img = _render_main(img, d, src, playing, title, artist, art, b, view, device, inputs)
-    if pair_until > now:
-        d = ImageDraw.Draw(img)
-        left = int(pair_until - now)
-        msg = f"Pairing mode  {left // 60}:{left % 60:02d}"
-        sub = fit(d, f"Look for \u201c{bt_name}\u201d" if bt_name else "Open Bluetooth on your phone",
-                  F_SM, W - 12)
-        d.rectangle((0, H - 46, W, H), fill=(20, 60, 160))
-        d.text(((W - d.textlength(msg, font=F_SM)) / 2, H - 42), msg, font=F_SM, fill="white")
-        d.text(((W - d.textlength(sub, font=F_SM)) / 2, H - 22), sub, font=F_SM, fill=(200, 220, 255))
-    return img
-
-
-def _render_main(img, d, src, playing, title, artist, art, b, view, device, inputs):
-
-    if view == "battery" and b:
-        d.text((10, 8), "Battery", font=F_LG, fill="white")
-        pct = f"{round(b['soc'] * 100)}%"
-        d.text(((W - d.textlength(pct, font=F_XL)) / 2, 40), pct, font=F_XL, fill=batt_color(b))
-        rows = [("Voltage", f"{b['v']:.2f} V"),
-                ("Current", f"{b['i']:+.2f} A"),
-                ("Power", f"{b['v'] * b['i']:+.0f} W"),
-                ("Avg draw", f"{b['avg']:.2f} A"),
-                ("Peak", f"{b['peak']:.1f} A"),
-                ("Runtime", fmt_hrs(b["hrs"]) or "--")]
-        for n, (k, v) in enumerate(rows):
-            y = 110 + n * 21
-            d.text((14, y), k, font=F_SM, fill=(160, 160, 160))
-            d.text((W - 14 - d.textlength(v, font=F_MD), y - 2), v, font=F_MD, fill="white")
-        if not b["synced"]:
-            d.text((14, H - 16), "~ estimate until first full charge", font=font(11), fill=(130, 130, 130))
-        return img
-
-    if not src:   # idle
-        if LOGO_IMG:
-            img.paste(LOGO_IMG)
-            d = ImageDraw.Draw(img)
-        else:
-            msg = "Ready"
-            d.text(((W - d.textlength(msg, font=F_XL)) / 2, 80), msg, font=F_XL, fill=(150, 150, 150))
-        d.rectangle((0, H - 48, W, H), fill=(0, 0, 0))
-        if inputs:
-            line = fit(d, "  ·  ".join(inputs), F_SM, W - 16)
-            d.text(((W - d.textlength(line, font=F_SM)) / 2, H - 44), line, font=F_SM, fill=(140, 140, 140))
-        if "Bluetooth" in inputs:
-            hint = fit(d, PAIR_HINT, F_SM, W - 16)
-            d.text(((W - d.textlength(hint, font=F_SM)) / 2, H - 22), hint, font=F_SM, fill=(110, 160, 255))
-        if b:
-            d.rectangle((0, 0, W, 26), fill=(0, 0, 0))
-            draw_status(d, b)
-        return img
-
-    if not title:  # a source is active but has no track info (BT without AVRCP, Roon, ...)
-        draw_status(d, b)
-        label = SOURCE_ICON.get(src, "") + src
-        d.text(((W - d.textlength(label, font=F_LG)) / 2, 95), label, font=F_LG, fill="white")
-        sub = device or ("Connected" if src == "Bluetooth" else "Playing")
-        sub = fit(d, sub, F_MD, W - 16)
-        d.text(((W - d.textlength(sub, font=F_MD)) / 2, 125), sub, font=F_MD, fill=(170, 170, 170))
-        return img
-
-    draw_status(d, b)
-    if art is not None:
-        img.paste(art, ((W - ART) // 2, 28))
-    else:
-        d.rectangle(((W - ART) // 2, 28, (W + ART) // 2, 28 + ART), outline=(60, 60, 60), width=2)
-        d.text((W / 2 - 8, 28 + ART / 2 - 14), "♪", font=font(28), fill=(90, 90, 90))
-    badge = src if not device else f"{src} · {device}"
-    badge = fit(d, badge, font(12), ART - 8)
-    bw = d.textlength(badge, font=font(12)) + 10
-    bx = (W - ART) // 2 + 4
-    d.rounded_rectangle((bx, 28 + ART - 20, bx + bw, 28 + ART - 4), radius=4, fill=(0, 0, 0))
-    d.text((bx + 5, 28 + ART - 19), badge, font=font(12), fill=(220, 220, 220))
-    d.text((8, 192), fit(d, title, F_LG, W - 16), font=F_LG, fill="white")
-    d.text((8, 216), fit(d, artist, F_MD, W - 16), font=F_MD, fill=(180, 180, 180))
-    if not playing:
-        d.text((W - 26, 192 - 24), "❚❚", font=F_SM, fill=(200, 200, 200))
-    return img
-
-
-# ------------------------------------------------------------------ buttons
-def setup_buttons(display):
-    try:
-        from gpiozero import Button
-    except ImportError:
-        log.warning("gpiozero not available; buttons disabled")
-        return []
-
-    def toggle_screen():
-        with S.lock:
-            S.screen_on = not S.screen_on
-            on = S.screen_on
-        display.set_backlight(1 if on else 0)
-        S.dirty.set()
-
-    def toggle_view():
-        with S.lock:
-            S.view = "battery" if S.view == "now" else "now"
-        S.dirty.set()
-
-    def run(cmd):
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-
-    import btctl
-
-    def kick():
-        S.set(screen_on=True)
-        display.set_backlight(1)
-        names = btctl.kick()
-        CONN.suppress.update(names)
-        if S.source == "AirPlay" and btctl.kick_airplay():
-            names.append("AirPlay sender")
-        if names:
-            toast("Disconnected", ", ".join(names), (230, 90, 60))
-        else:
-            toast("Nothing connected", "", (150, 150, 150))
-
-    def pairing():
-        if S.pairing_until > time.monotonic():      # long-press again = cancel
-            btctl.hide()
-            S.set(pairing_until=0.0)
-            toast("Pairing off", "", (150, 150, 150), 2)
-            return
-        btctl.pairing_mode(PAIR_S, on_done=lambda: S.set(pairing_until=0.0))
-        S.set(bt_name=btctl.alias() or S.bt_name)
-        S.set(pairing_until=time.monotonic() + PAIR_S)
-
-    short = {"A": toggle_screen, "B": toggle_view,
-             "X": lambda: run(VOL_UP), "Y": lambda: run(VOL_DN)}
-    long = {"A": kick, "B": pairing}
-    try:
-        from gpiozero.pins.lgpio import LGPIOFactory
-        factory = LGPIOFactory(chip=display.chip_num)
-    except Exception as e:
-        log.warning("lgpio pin factory: %s (using gpiozero default)", e)
-        factory = None
-    btns = []
-    held = {}
-    for name, pin in BUTTONS.items():
+    @staticmethod
+    def _out(cmd):
         try:
-            b = Button(pin, pull_up=True, bounce_time=0.05, hold_time=LONG_PRESS_S,
-                       pin_factory=factory)
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=3).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+
+    def _join(self, sy):
+        """SSID + password of the Wi-Fi the Pi is on (home network or its own hotspot), for the QR code.
+        NetworkManager only reveals the password to root, hence sudo -n."""
+        j = dict(ssid=sy.get("ssid", ""), hotspot=sy.get("hotspot"), ip=sy.get("ip"), host=sy.get("host"))
+        if not j["ssid"]:
+            return j
+        if WIFI_QR_PSK is not None:
+            j["psk"] = WIFI_QR_PSK
+            return j
+        name = ""
+        for ln in self._out(["nmcli", "-t", "-f", "NAME,DEVICE", "connection", "show", "--active"]).splitlines():
+            n, _, dev = ln.rpartition(":")
+            if dev == "wlan0":
+                name = n.replace("\\:", ":")
+        if name:
+            psk = self._out(["sudo", "-n", "nmcli", "-s", "-g", "802-11-wireless-security.psk",
+                             "connection", "show", name]).strip()
+            j["psk"] = psk          # "" = open network
+        return j
+
+    def _warn(self, key, *args, **kw):
+        if time.monotonic() - self.warned.get(key, -1e9) > 600:
+            self.warned[key] = time.monotonic()
+            popup(*args, secs=8, **kw)
+
+    def run(self):
+        last_net = 0
+        while True:
+            sy = dict(S.sys)
+            try:
+                with open("/sys/class/thermal/thermal_zone0/temp") as f:
+                    sy["temp"] = int(f.read()) / 1000
+            except (OSError, ValueError):
+                sy["temp"] = None
+            thr = self._out(["vcgencmd", "get_throttled"]).strip()
+            try:
+                bits = int(thr.split("=")[1], 16)
+                sy["uv_now"], sy["uv_seen"] = bool(bits & 0x1), bool(bits & 0x10000)
+            except (IndexError, ValueError):
+                pass
+            try:
+                with open("/proc/uptime") as f:
+                    sy["uptime"] = float(f.read().split()[0])
+            except OSError:
+                pass
+            if S.view in ("system", "join") or time.monotonic() - last_net > 60:
+                last_net = time.monotonic()
+                info = self._out(["iw", "dev", "wlan0", "info"])
+                sy["hotspot"] = "type AP" in info
+                sy["ssid"] = next((ln.split("ssid", 1)[1].strip() for ln in info.splitlines()
+                                   if ln.strip().startswith("ssid ")), "")
+                sy["rssi"] = None
+                if not sy["hotspot"]:
+                    for ln in self._out(["iw", "dev", "wlan0", "link"]).splitlines():
+                        if "signal:" in ln:
+                            try:
+                                sy["rssi"] = int(ln.split("signal:")[1].split()[0])
+                            except (IndexError, ValueError):
+                                pass
+                ips = self._out(["hostname", "-I"]).split()
+                sy["ip"] = ips[0] if ips else ""
+                sy["host"] = socket.gethostname() + ".local"
+                S.set(join=self._join(sy))
+            S.set(sys=sy)
+            if sy.get("temp") and sy["temp"] >= HOT_C:
+                self._warn("hot", "warn", ui.AMBER, "Running hot", f"{sy['temp']:.0f}°C", "Shade the box or open the lid")
+            if sy.get("uv_now"):
+                self._warn("uv", "warn", ui.RED, "Power supply", "Voltage low", "Check the 5 V wiring")
+            time.sleep(5)
+
+
+# ------------------------------------------------------------------ menu
+def _view_tile(m, view, icon, label):
+    here = m.get("view", "now") == view
+    return dict(id="view", view=view, icon="music" if here else icon, label="Now playing" if here else label)
+
+
+def menu_items(m):
+    """Main menu for the current state (also used by preview.py)."""
+    items = []
+    if m.get("source") == "Bluetooth" and m.get("device"):
+        items.append(dict(id="kick", icon="bt_off", color=ui.RED, label=f"Disconnect {m['device']}",
+                          confirm="Confirm disconnect"))
+    elif m.get("source") == "AirPlay":
+        items.append(dict(id="kick", icon="bt_off", color=ui.RED, label="Stop AirPlay", confirm="Confirm stop"))
+    else:
+        items.append(dict(id="kick", icon="bt_off", label="No phone connected", enabled=False))
+    pairing = bool(m.get("pairing_left"))
+    items.append(dict(id="pair", icon="plus", color=ui.BLUE, label="Stop pairing" if pairing else "Add a phone"))
+    items.append(_view_tile(m, "phones", "phone", "Phones"))
+    items.append(_view_tile(m, "join", "qr", "Join Wi-Fi"))
+    items.append(_view_tile(m, "battery", "battery", "Battery"))
+    items.append(_view_tile(m, "system", "system", "System"))
+    items.append(dict(id="help", label="Controls", header=True))
+    return items
+
+
+def phone_items(dev):
+    """Action sheet for one paired phone."""
+    items = []
+    if dev.get("connected"):
+        items.append(dict(id="disconnect", icon="bt_off", color=ui.RED, label="Disconnect",
+                          confirm="Confirm disconnect"))
+    elif dev.get("blocked"):
+        items.append(dict(id="unblock", icon="bt", color=ui.BLUE, label="Unblock now"))
+    items.append(dict(id="forget", icon="x", color=ui.RED, label="Forget phone", confirm="Confirm forget"))
+    items.append(dict(id="cancel", icon="x", label="Cancel"))
+    return items
+
+
+def _phone(mac):
+    return next((p for p in S.phones if p["mac"] == mac), None)
+
+
+def current_menu_items(m=None):
+    menu = S.menu or {}
+    if menu.get("kind") == "phone":
+        dev = _phone(menu.get("mac"))
+        return phone_items(dev) if dev else [dict(id="cancel", icon="x", label="Cancel")]
+    return menu_items(m if m is not None else snapshot(with_menu=False))
+
+
+def _bt(fn, *args):
+    def run():
+        try:
+            import btctl
+            getattr(btctl, fn)(*args)
+            CONN.refresh.set()
         except Exception as e:
-            log.warning("button %s (GPIO %d) disabled: %s", name, pin, e)
-            continue
-        held[name] = False
+            log.warning("bluetooth %s: %s", fn, e)
+    threading.Thread(target=run, daemon=True).start()
 
-        def on_held(name=name):
-            held[name] = True
-            if name in long:
-                threading.Thread(target=long[name], daemon=True).start()
 
-        def on_released(name=name):
-            if not held[name]:
-                threading.Thread(target=short[name], daemon=True).start()
-            held[name] = False
+def _menu_select(k):
+    items = current_menu_items()
+    if not (0 <= k < len(items)) or not items[k].get("enabled", True):
+        return
+    it = items[k]
+    if it.get("confirm") and S.menu.get("confirm_until", 0) < time.monotonic():   # first press arms it
+        S.menu["confirm_until"] = time.monotonic() + 3
+        S.menu["sel"] = k
+        S.dirty.set()
+        return
+    menu = S.menu
+    S.set(menu=None)
+    i = it["id"]
+    if i == "kick":
+        threading.Thread(target=kick, daemon=True).start()
+    elif i == "pair":
+        end_pairing() if S.pairing_until > time.monotonic() else start_pairing()
+    elif i == "view":
+        S.set(view="now" if S.view == it["view"] else it["view"])
+    elif i == "help":
+        S.set(help=True)
+    elif i == "disconnect":
+        dev = _phone(menu.get("mac")) or {}
+        CONN.suppress.add(dev.get("name", ""))
+        _bt("disconnect", menu["mac"])
+        popup("bt_off", (255, 255, 255), "Disconnected", dev.get("name", ""),
+              "Can't reconnect for 5 min", icon_alpha=40)
+    elif i == "unblock":
+        _bt("unblock", menu["mac"])
+    elif i == "forget":
+        dev = _phone(menu.get("mac")) or {}
+        CONN.suppress.add(dev.get("name", ""))
+        _bt("forget", menu["mac"])
+        popup("x", (255, 255, 255), "Forgotten", dev.get("name", ""), "It will need to pair again", icon_alpha=40)
 
-        b.when_held = on_held
-        b.when_released = on_released
-        btns.append(b)
-    return btns
+
+def open_menu():
+    S.set(menu=dict(kind="main", sel=0, opened=time.monotonic(), confirm_until=0), help=False)
+
+
+def open_phone_sheet(i):
+    if 0 <= i < len(S.phones):
+        S.set(phone_sel=i, menu=dict(kind="phone", mac=S.phones[i]["mac"], sel=0,
+                                     opened=time.monotonic(), confirm_until=0), help=False)
+
+
+# ------------------------------------------------------------------ input handling
+SCREEN = {"bright": 1.0}
+
+
+def handle(ev):
+    kind = ev[0]
+    asleep = SCREEN["bright"] <= 0.0
+    S.poke()
+    S.last_input = time.monotonic()
+    if asleep and kind in ("tap", "swipe", "touch_hold"):
+        return                                   # first touch only wakes the screen
+    if kind == "turn" and not S.menu and not S.help and S.view == "phones" and S.phones:
+        S.set(phone_sel=(S.phone_sel + ev[1]) % len(S.phones), phone_focus=True)    # knob picks a phone
+        return
+    if kind == "turn" and not S.menu:
+        S.set(popup=None)                        # the volume bar takes over from any popup
+        VOL.step(ev[1])
+        return
+
+    if S.help:                                   # any press/tap closes the controls card
+        if kind in ("press", "double", "hold", "tap", "touch_hold"):
+            S.set(help=False)
+        return
+
+    if S.menu:
+        S.menu["opened"] = time.monotonic()
+        items = current_menu_items()
+        n = len(items)
+        if kind == "turn":
+            S.menu["sel"] = (S.menu.get("sel", 0) + ev[1]) % n
+            S.menu["confirm_until"] = 0
+            S.dirty.set()
+        elif kind == "press":
+            _menu_select(S.menu.get("sel", 0))
+        elif kind in ("hold", "touch_hold"):
+            S.set(menu=None)
+        elif kind == "tap":
+            hit = ui.menu_hit(ev[1], ev[2], items)
+            if hit == "close":
+                S.set(menu=None)
+            elif hit is not None:
+                if hit != S.menu.get("sel"):
+                    S.menu["confirm_until"] = 0
+                S.menu["sel"] = hit
+                _menu_select(hit)
+        return
+
+    if kind == "tap" and S.popup and S.popup[1] > time.monotonic():
+        S.set(popup=None)
+        return
+    if S.view == "phones" and kind == "press" and S.phones:
+        open_phone_sheet(S.phone_sel)
+        return
+    if S.view == "phones" and kind == "tap" and ev[2] >= ui.STATUS_H:
+        hit = ui.phones_hit(ev[1], ev[2], len(S.phones), S.phone_sel)
+        if hit is not None:
+            open_phone_sheet(hit)
+        return
+    if kind == "press":
+        play_pause()
+    elif kind == "double":
+        next_track()
+    elif kind in ("hold", "touch_hold"):
+        open_menu()
+    elif kind == "swipe" and ev[1] in ("left", "right"):
+        i = VIEWS.index(S.view) if S.view in VIEWS else 0
+        S.set(view=VIEWS[(i + (1 if ev[1] == "left" else -1)) % len(VIEWS)], phone_focus=False, controls_until=0.0)
+    elif kind == "tap":
+        if ev[2] < ui.STATUS_H:
+            open_menu()
+        elif S.view == "now" and S.source:
+            tap_now_playing(ev[1], ev[2])
+
+
+def tap_now_playing(x, y):
+    """First tap shows the control bar; taps on it run its buttons; a tap elsewhere hides it."""
+    now = time.monotonic()
+    if S.controls_until <= now:
+        S.set(controls_until=now + CONTROLS_S, vol_level=Volume.current(), vol_show=None)
+        return
+    hit = ui.controls_hit(x, y)
+    if hit is None:
+        S.set(controls_until=0.0)
+        return
+    S.set(controls_until=now + CONTROLS_S)
+    if hit == "play":
+        play_pause()
+    elif hit == "next":
+        next_track()
+    elif hit == "prev":
+        prev_track()
+    elif hit == "vol_up":
+        VOL.step(1, VOL_TOUCH_STEP)
+    elif hit == "vol_down":
+        VOL.step(-1, VOL_TOUCH_STEP)
+
+
+# ------------------------------------------------------------------ rendering
+def snapshot(with_menu=True):
+    now = time.monotonic()
+    with S.lock:
+        m = dict(source=S.source, device=S.device, playing=S.playing, title=S.title, artist=S.artist,
+                 album=S.album, art=S.art, batt=S.batt, view=S.view, bt_name=S.bt_name,
+                 airplay_name=S.airplay_name, bt_visible=S.bt_visible, inputs=S.inputs,
+                 sys=S.sys, touch=S.touch, t=now, help=S.help, phones=list(S.phones),
+                 phone_sel=min(S.phone_sel, max(0, len(S.phones) - 1)), phone_focus=S.phone_focus or S.touch,
+                 join=S.join, stats=S.stats, now_wall=time.time(),
+                 knob=any(v is not None for v in KNOB.values()))
+        if S.controls_until > now:
+            m["controls"] = dict(playing=S.playing, volume=S.vol_level, cap=VOL_MAX)
+        if S.popup and S.popup[1] > now:
+            m["popup"] = S.popup[0]
+        if S.vol_show and S.vol_show[1] > now:
+            m["volume"] = (S.vol_show[0], VOL_MAX)
+        if S.pairing_until > now:
+            left = int(S.pairing_until - now)
+            m["pairing_left"] = (left, left / PAIR_S)
+        menu = S.menu
+    if m["view"] == "now" and not m["source"] and (m["batt"] or {}).get("charging"):
+        m["view"] = "battery"                    # idle + plugged in: show charging
+    if menu and with_menu:
+        if menu.get("kind") == "phone":
+            dev = _phone(menu.get("mac")) or {}
+            items = current_menu_items(m)
+            title = dev.get("name", "Phone")
+            sub = ("Connected" if dev.get("connected") else "Blocked for a few minutes" if dev.get("blocked")
+                   else "Paired") if dev else "No longer paired"
+        else:
+            items = menu_items(m)
+            title = f"{m['device']} connected" if m.get("device") else (m.get("bt_name") or "Menu")
+            sub = ""
+        sel = menu.get("sel", 0)
+        if menu.get("confirm_until", 0) > now and 0 <= sel < len(items):
+            items[sel]["confirming"] = True
+        m["menu"] = dict(items=items, sel=sel, title=title, subtitle=sub)
+    return m
+
+
+def target_brightness(m):
+    idle_for = time.monotonic() - S.activity
+    if (m.get("popup") or m.get("menu") or m.get("help") or m.get("volume") or m.get("pairing_left")
+            or m.get("controls")):
+        return BRIGHT_FULL
+    if idle_for < 10 or (m["source"] and m["playing"]):
+        return BRIGHT_FULL
+    if m["source"]:
+        return BRIGHT_DIM if idle_for > DIM_PAUSED_S else BRIGHT_FULL
+    if idle_for > OFF_IDLE_S:
+        return 0.0
+    return BRIGHT_DIM if idle_for > DIM_IDLE_S else BRIGHT_FULL
+
+
+def animating(m):
+    """Screens with motion get redrawn on a timer."""
+    if m.get("pairing_left") or m.get("popup") or m.get("volume") or m.get("controls"):
+        return 0.5
+    if m["view"] == "battery" and (m["batt"] or {}).get("charging"):
+        return 0.5
+    if m["view"] == "now" and not m["source"] and m.get("bt_visible"):
+        return 0.5
+    return None
+
+
+def save_splash(name):
+    try:
+        img = ui.render(dict(splash_kind="boot", splash_title=name, splash_sub="Starting up…", t=0.3))
+        img.save(SPLASH_CACHE + ".tmp.png")
+        os.replace(SPLASH_CACHE + ".tmp.png", SPLASH_CACHE)
+    except Exception as e:
+        log.debug("splash cache: %s", e)
 
 
 # ------------------------------------------------------------------ main
 def main():
     from st7789_lite import ST7789
-    display = ST7789(port=0, cs=1, dc=9, backlight=13, rotation=90,
-                     spi_speed_hz=80 * 1000 * 1000, width=W, height=H)
+    display = ST7789(panel=PANEL, rotation=ROTATION, **SCREEN_PINS)
+    if (display.width, display.height) != (ui.W, ui.H):
+        raise SystemExit(f"ROTATION {ROTATION} gives {display.width}x{display.height}; UI expects {ui.W}x{ui.H}")
     log.info("display up on /dev/gpiochip%d", display.chip_num)
+    boot_t = time.monotonic()
+    try:
+        import btctl
+        S.set(bt_name=btctl.alias())
+    except Exception as e:
+        log.warning("bluetooth name: %s", e)
+
+    def splash(sub, kind="boot"):
+        display.display(ui.render(dict(splash_kind=kind, splash_title=S.bt_name or "Speaker",
+                                       splash_sub=sub, t=time.monotonic() - boot_t)))
+    splash("Starting up…")
 
     batt = None
     if BATTERY_ENABLED:
@@ -397,32 +825,94 @@ def main():
     def shutdown(*_):
         if batt:
             batt.g.save()
+        try:      # system going down (not just a service restart): leave a goodbye on screen
+            state = subprocess.run(["systemctl", "is-system-running"], capture_output=True, text=True,
+                                   timeout=1).stdout.strip()
+        except Exception:
+            state = ""
+        if state == "stopping":
+            splash("Safe to switch off when the screen goes dark", kind="off")
+            display.set_backlight(1)
+        else:
+            display.set_backlight(0)
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
 
     from sources import SourceWatcher
-    SourceWatcher(S, ART).start()
+    SourceWatcher(S, ui.ART_PX).start()
+    SysThread().start()
+    VOL.start()
     try:
         import btctl
         btctl.startup_cleanup()
-        if HIDE_BY_DEFAULT:
-            btctl.hide()
-        S.set(bt_name=btctl.alias())
         CONN.start()
     except Exception as e:
         log.error("bluetooth control disabled: %s", e)
-    buttons = setup_buttons(display)  # noqa: F841  (keep references alive)
+    save_splash(S.bt_name or "Speaker")
 
-    S.dirty.set()
+    # ---- inputs
+    from inputs import Inputs
+    inp = Inputs(handle)
+    try:
+        from gpiozero.pins.lgpio import LGPIOFactory
+        factory = LGPIOFactory(chip=display.chip_num)
+    except Exception as e:
+        log.warning("lgpio pin factory: %s (using gpiozero default)", e)
+        factory = None
+    inp.add_encoder(KNOB.get("a"), KNOB.get("b"), KNOB.get("sw"), factory, KNOB_REVERSE, DOUBLE_S, KNOB_HOLD_S)
+    if TOUCH:
+        try:
+            from cst816 import CST816
+            t = CST816(rst=TOUCH_PINS.get("rst"), gpio_chip=display.chip, mapping=TOUCH_MAP)
+            inp.add_touch(t)
+            S.set(touch=True)
+        except Exception as e:
+            (log.info if TOUCH == "auto" else log.error)("no touch controller: %s", e)
+    inp.add_fifo(CTL_FIFO)
+
+    # ---- wait briefly for moOde before leaving the splash
+    while not S.ready and time.monotonic() - boot_t < 20:
+        splash("Starting up…")
+        time.sleep(0.25)
+
+    S.poke()
+    last_refresh = time.monotonic()
+    last_key = None
     while True:
-        busy = (S.toast and time.monotonic() < S.toast[3] + 0.5) or S.pairing_until > time.monotonic()
-        S.dirty.wait(timeout=1 if busy else 5)
+        m = snapshot()
+        # expire transient UI
+        if S.popup and S.popup[1] <= m["t"]:
+            S.set(popup=None)
+        if S.menu and m["t"] - S.menu.get("opened", 0) > MENU_TIMEOUT_S:
+            S.set(menu=None)
+        if S.view != "now" and not S.menu and m["t"] - S.last_input > VIEW_TIMEOUT_S:
+            S.set(view="now", phone_focus=False)
+        # anything new playing counts as activity (wakes a dimmed screen)
+        key = (m["source"], m["title"], m["playing"], m["device"])
+        if key != last_key:
+            last_key = key
+            S.activity = time.monotonic()
+        # backlight
+        want = target_brightness(m)
+        if want != SCREEN["bright"]:
+            display.set_backlight(want)
+            SCREEN["bright"] = want
+        # recover from a power-dip reset of the panel
+        if m["t"] - last_refresh > 30:
+            last_refresh = m["t"]
+            try:
+                display.refresh_config()
+            except Exception as e:
+                log.warning("screen refresh: %s", e)
+        if want > 0:
+            t0 = time.monotonic()
+            display.display(ui.render(snapshot()))
+            log.debug("frame %.0f ms", (time.monotonic() - t0) * 1000)
         S.dirty.clear()
-        if S.screen_on:
-            display.display(render())
-        time.sleep(0.15)   # coalesce bursts of updates
+        S.dirty.wait(timeout=animating(m) or 5)
+        time.sleep(0.05)       # coalesce bursts of updates
 
 
 if __name__ == "__main__":
