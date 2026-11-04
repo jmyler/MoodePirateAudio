@@ -42,8 +42,9 @@ PANEL = "waveshare2"       # Waveshare 2" 240x320, used landscape
 ROTATION = 90              # 90 or 270 - flip if the picture is upside down
 SCREEN_PINS = dict(port=0, cs=1, dc=9, backlight=13, rst=27)
 
-# Knob (rotary encoder with push switch). Set a pin to None if it isn't fitted.
-KNOB = dict(a=5, b=6, sw=16)
+# Knob (rotary encoder with push switch). Not fitted on this build: the touch screen and the
+# phone do everything. To add one later, wire it to GPIO 5/6/16 and use dict(a=5, b=6, sw=16).
+KNOB = dict(a=None, b=None, sw=None)
 KNOB_REVERSE = False       # True if turning clockwise turns the volume down
 KNOB_HOLD_S = 1.0          # hold this long for the menu
 DOUBLE_S = 0.35            # second press within this = double press
@@ -55,6 +56,8 @@ TOUCH_MAP = "rot90" if ROTATION == 90 else "rot270"     # see touch_test.py
 
 # Volume (moOde)
 VOL_STEP = 2               # per knob detent
+VOL_TOUCH_STEP = 5         # per tap on the screen's volume buttons
+CONTROLS_S = 5             # touch control bar hides after this long untouched
 VOL_MAX = 100              # cap, e.g. 85 so a borrowed phone can't run it flat out
 VOL_SH = "/var/www/util/vol.sh"
 
@@ -117,6 +120,8 @@ class State:
         self.phone_focus = False       # knob has moved the highlight on the Phones screen
         self.join = {}                 # Wi-Fi / moOde details for the QR codes
         self.stats = {}                # session stats
+        self.controls_until = 0.0      # touch control bar on Now playing
+        self.vol_level = 0
 
     def set(self, **kw):
         changed = False
@@ -185,6 +190,20 @@ def play_pause():
         popup("pause", (255, 255, 255), "Can't control", src, "Pause from the phone", icon_alpha=40)
 
 
+def prev_track():
+    src = S.source
+    import btctl
+    ok = False
+    if src == "Bluetooth":
+        ok = btctl.player("Previous")
+    elif src == "AirPlay":
+        ok = _airplay("Previous")
+    elif src in ("Library", "Radio"):
+        ok = _run(["mpc", "-q", "prev"])
+    if not ok and src:
+        popup("next", (255, 255, 255), "Can't go back", src, "Use the phone", icon_alpha=40)
+
+
 def next_track():
     src = S.source
     import btctl
@@ -206,6 +225,7 @@ class Volume(threading.Thread):
     def __init__(self):
         super().__init__(name="volume")
         self.target = None
+        self.last_step = 0.0
         self.cv = threading.Condition()
 
     @staticmethod
@@ -219,14 +239,17 @@ class Volume(threading.Thread):
         except Exception:
             return 50
 
-    def step(self, n):
+    def step(self, n, size=VOL_STEP):
         with self.cv:
-            shown = S.vol_show and S.vol_show[1] > time.monotonic()
-            base = self.target if (self.target is not None and shown) else self.current()
-            self.target = max(0, min(VOL_MAX, base + n * VOL_STEP))
+            recent = time.monotonic() - self.last_step < 3
+            base = self.target if (self.target is not None and recent) else self.current()
+            self.target = max(0, min(VOL_MAX, base + n * size))
             level = self.target
+            self.last_step = time.monotonic()
             self.cv.notify()
-        S.set(vol_show=(level, time.monotonic() + VOL_SHOW_S))
+        S.set(vol_level=level)
+        if not (S.controls_until > time.monotonic()):       # the control bar shows volume itself
+            S.set(vol_show=(level, time.monotonic() + VOL_SHOW_S))
         S.poke()
 
     def run(self):
@@ -666,12 +689,35 @@ def handle(ev):
         open_menu()
     elif kind == "swipe" and ev[1] in ("left", "right"):
         i = VIEWS.index(S.view) if S.view in VIEWS else 0
-        S.set(view=VIEWS[(i + (1 if ev[1] == "left" else -1)) % len(VIEWS)], phone_focus=False)
+        S.set(view=VIEWS[(i + (1 if ev[1] == "left" else -1)) % len(VIEWS)], phone_focus=False, controls_until=0.0)
     elif kind == "tap":
         if ev[2] < ui.STATUS_H:
             open_menu()
         elif S.view == "now" and S.source:
-            play_pause()
+            tap_now_playing(ev[1], ev[2])
+
+
+def tap_now_playing(x, y):
+    """First tap shows the control bar; taps on it run its buttons; a tap elsewhere hides it."""
+    now = time.monotonic()
+    if S.controls_until <= now:
+        S.set(controls_until=now + CONTROLS_S, vol_level=Volume.current(), vol_show=None)
+        return
+    hit = ui.controls_hit(x, y)
+    if hit is None:
+        S.set(controls_until=0.0)
+        return
+    S.set(controls_until=now + CONTROLS_S)
+    if hit == "play":
+        play_pause()
+    elif hit == "next":
+        next_track()
+    elif hit == "prev":
+        prev_track()
+    elif hit == "vol_up":
+        VOL.step(1, VOL_TOUCH_STEP)
+    elif hit == "vol_down":
+        VOL.step(-1, VOL_TOUCH_STEP)
 
 
 # ------------------------------------------------------------------ rendering
@@ -683,7 +729,10 @@ def snapshot(with_menu=True):
                  airplay_name=S.airplay_name, bt_visible=S.bt_visible, inputs=S.inputs,
                  sys=S.sys, touch=S.touch, t=now, help=S.help, phones=list(S.phones),
                  phone_sel=min(S.phone_sel, max(0, len(S.phones) - 1)), phone_focus=S.phone_focus or S.touch,
-                 join=S.join, stats=S.stats, now_wall=time.time())
+                 join=S.join, stats=S.stats, now_wall=time.time(),
+                 knob=any(v is not None for v in KNOB.values()))
+        if S.controls_until > now:
+            m["controls"] = dict(playing=S.playing, volume=S.vol_level, cap=VOL_MAX)
         if S.popup and S.popup[1] > now:
             m["popup"] = S.popup[0]
         if S.vol_show and S.vol_show[1] > now:
@@ -714,7 +763,8 @@ def snapshot(with_menu=True):
 
 def target_brightness(m):
     idle_for = time.monotonic() - S.activity
-    if m.get("popup") or m.get("menu") or m.get("help") or m.get("volume") or m.get("pairing_left"):
+    if (m.get("popup") or m.get("menu") or m.get("help") or m.get("volume") or m.get("pairing_left")
+            or m.get("controls")):
         return BRIGHT_FULL
     if idle_for < 10 or (m["source"] and m["playing"]):
         return BRIGHT_FULL
@@ -727,7 +777,7 @@ def target_brightness(m):
 
 def animating(m):
     """Screens with motion get redrawn on a timer."""
-    if m.get("pairing_left") or m.get("popup") or m.get("volume"):
+    if m.get("pairing_left") or m.get("popup") or m.get("volume") or m.get("controls"):
         return 0.5
     if m["view"] == "battery" and (m["batt"] or {}).get("charging"):
         return 0.5

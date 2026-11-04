@@ -413,8 +413,9 @@ def scr_now(m):
         cx, cy = 14 + ART / 2, 34 + ART / 2
         d.ellipse(s(cx - 22, cy - 22, cx + 22, cy + 22), fill=(0, 0, 0, 120))
         pause_glyph(d, cx, cy, 16, WHITE)
-        pause_glyph(d, 18, 223, 9, T2)
-        d.text(s(30, 223), "Paused", font=F("SemiBold", 10), fill=T2, anchor="lm")
+        if not m.get("_overlay_bottom"):
+            pause_glyph(d, 18, 223, 9, T2)
+            d.text(s(30, 223), "Paused", font=F("SemiBold", 10), fill=T2, anchor="lm")
     elif not m.get("_overlay_bottom"):
         eq_glyph(d, 14, 228, T2)
     return im
@@ -872,15 +873,15 @@ def scr_stats(m):
     return im
 
 
-def ov_help(im, touch):
+def ov_help(im, touch, knob=False):
     im = dim(im, 0.5)
     d = frosted(im, (6, 6, 314, 234), r=18)
     d.text(s(20, 24), "Controls", font=F("Bold", 15, True), fill=WHITE, anchor="lm")
-    d.text(s(300, 24), "tap or press knob to close" if touch else "press knob to close", font=F("Medium", 9), fill=T3, anchor="rm")
-    knob = [("Turn", "Volume"), ("Press", "Play / pause"), ("Press twice", "Next track"), ("Hold", "Menu")]
-    screen = [("Tap", "Play / pause"), ("Swipe", "Change screen"), ("Tap top bar", "Menu"),
-              ("Tap a popup", "Dismiss")]
-    cols = [("Knob", knob)] + ([("Screen", screen)] if touch else [])
+    d.text(s(300, 24), "tap to close", font=F("Medium", 9), fill=T3, anchor="rm")
+    screen = [("Tap the song", "Play, skip and volume buttons"), ("Swipe left / right", "Change screen"),
+              ("Tap the top bar", "Menu: phones, pairing, Wi-Fi"), ("Tap a popup", "Dismiss it")]
+    knobc = [("Turn", "Volume"), ("Press", "Play / pause"), ("Press twice", "Next track"), ("Hold", "Menu")]
+    cols = ([("Screen", screen)] if touch or not knob else []) + ([("Knob", knobc)] if knob else [])
     cw = 292 / len(cols)
     for c, (head, rows) in enumerate(cols):
         x0 = 14 + c * cw
@@ -889,7 +890,62 @@ def ov_help(im, touch):
         for r, (a, b) in enumerate(rows):
             y = 84 + r * 36
             d.text(s(x0 + 12, y), a, font=F("Medium", 10), fill=T2, anchor="lm")
-            d.text(s(x0 + 12, y + 15), b, font=F("SemiBold", 12), fill=T1, anchor="lm")
+            d.text(s(x0 + 12, y + 15), fit(d, b, F("SemiBold", 12), cw - 30), font=F("SemiBold", 12), fill=T1,
+                   anchor="lm")
+    return im
+
+
+# ---------------------------------------------------------------- touch control bar
+CTRL_BOX = (10, 154, 310, 230)
+CTRL_BTNS = [("vol_down", 40), ("prev", 100), ("play", 160), ("next", 220), ("vol_up", 280)]
+CTRL_R = 26                     # touch radius around each button centre
+
+
+def controls_hit(x, y):
+    """Which control-bar button a tap hit, 'bar' for the bar itself, or None (outside)."""
+    if not (CTRL_BOX[0] <= x <= CTRL_BOX[2] and CTRL_BOX[1] - 6 <= y <= CTRL_BOX[3]):
+        return None
+    cy = 198
+    for name, cx in CTRL_BTNS:
+        if abs(x - cx) <= 30 and abs(y - cy) <= CTRL_R + 10:
+            return name
+    return "bar"
+
+
+def ov_controls(im, c):
+    d = frosted(im, CTRL_BOX, r=20)
+    level, cap = c.get("volume", 0), c.get("cap", 100)
+    x0, x1, ty = 26, 294, 166                       # volume track along the top of the bar
+    d.rounded_rectangle(s(x0, ty - 2, x1, ty + 2), 2 * SS, fill=(255, 255, 255, 40))
+    if level > 0:
+        d.rounded_rectangle(s(x0, ty - 2, x0 + (x1 - x0) * level / 100, ty + 2), 2 * SS, fill=WHITE)
+    if cap < 100:
+        xc = x0 + (x1 - x0) * cap / 100
+        d.line(s(xc, ty - 5, xc, ty + 5), fill=(255, 255, 255, 140), width=int(1.5 * SS))
+    cy = 198
+    for name, cx in CTRL_BTNS:
+        if name == "play":
+            d.ellipse(s(cx - 22, cy - 22, cx + 22, cy + 22), fill=WHITE)
+            if c.get("playing"):
+                pause_glyph(d, cx, cy, 16, (20, 22, 30))
+            else:
+                d.polygon([s(cx - 6, cy - 9), s(cx + 10, cy), s(cx - 6, cy + 9)], fill=(20, 22, 30))
+        elif name in ("prev", "next"):
+            if name == "next":
+                next_glyph(d, cx, cy, 16, T1)
+            else:
+                h = 8
+                d.polygon([s(cx + h, cy - h * .8), s(cx, cy), s(cx + h, cy + h * .8)], fill=T1)
+                d.polygon([s(cx + h * .2, cy - h * .8), s(cx - h * .8, cy), s(cx + h * .2, cy + h * .8)], fill=T1)
+                d.rectangle(s(cx - h, cy - h * .8, cx - h * .8, cy + h * .8), fill=T1)
+        else:
+            d.ellipse(s(cx - 18, cy - 18, cx + 18, cy + 18), fill=(255, 255, 255, 26))
+            speaker_glyph(d, cx - 3, cy, 14, T1)
+            sx = cx + 9
+            d.line(s(sx - 3, cy + 9, sx + 3, cy + 9), fill=T1, width=int(1.6 * SS))
+            if name == "vol_up":
+                d.line(s(sx, cy + 6, sx, cy + 12), fill=T1, width=int(1.6 * SS))
+    d.text(s(296, 178), f"{level}", font=F("SemiBold", 9), fill=T2, anchor="rm")
     return im
 
 
@@ -903,7 +959,7 @@ def render(m):
         view = m.get("view", "now")
         pairing = m.get("pairing_left")
         vol = m.get("volume")
-        m = dict(m, _overlay_bottom=bool(pairing or vol))
+        m = dict(m, _overlay_bottom=bool(pairing or vol or m.get("controls")))
         if view == "battery":
             im = scr_battery(m)
         elif view == "stats":
@@ -920,14 +976,16 @@ def render(m):
             im = scr_idle(m)
         if pairing and m.get("source"):
             im = ov_pairing(im, pairing, m.get("bt_name") or "Speaker", m.get("device"))
-        if vol and not (m.get("menu") or m.get("help")):
+        if m.get("controls") and view == "now" and m.get("source"):
+            im = ov_controls(im, m["controls"])
+        elif vol and not (m.get("menu") or m.get("help")):
             im = ov_volume(im, vol)
         if m.get("popup"):
             im = ov_popup(im, m["popup"])
         if m.get("menu"):
             im = ov_menu(im, m["menu"])
         if m.get("help"):
-            im = ov_help(im, m.get("touch"))
+            im = ov_help(im, m.get("touch"), m.get("knob"))
     out = im.resize((W, H), Image.Resampling.LANCZOS)
     if not (m.get("menu") or m.get("help") or m.get("popup")):
         for img, xy in pastes:

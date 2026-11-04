@@ -74,13 +74,13 @@ def screens():
             ("Idle (Bluetooth first)", IDLE),
             ("Now playing", BASE),
             ("Paused", dict(BASE, playing=False)),
-            ("Volume (turn knob)", dict(BASE, volume=(62, 85))),
+            ("Tap the song: control bar", dict(BASE, controls=dict(playing=True, volume=62, cap=100))),
         ]),
-        ("Menu & help (hold knob / tap top bar)", [
+        ("Menu & help (tap the top bar)", [
             ("Menu", dict(BASE, menu=menu(0))),
             ("Disconnect: confirm", dict(BASE, menu=menu(0, True))),
-            ("Controls (touch fitted)", dict(BASE, help=True)),
-            ("Controls (knob only)", dict(BASE, help=True, touch=False)),
+            ("Controls (touch)", dict(BASE, help=True)),
+            ("Control bar, paused", dict(BASE, playing=False, controls=dict(playing=False, volume=40, cap=85))),
         ]),
         ("Popups", [
             ("Phone connects", pop(icon="bt", color=ui.BLUE, small="Connected", big="JPhone")),

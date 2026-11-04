@@ -2,7 +2,7 @@
 
 A small screen for a battery-powered moOde speaker. It shows what's playing
 and who's connected, tracks a LiFePO4 battery, and lets you control the
-speaker from a knob and a touch screen on the box.
+speaker from a touch screen on the box.
 
 Built for a Raspberry Pi running **moOde 10.x (Trixie, 64-bit)**:
 
@@ -11,7 +11,6 @@ Built for a Raspberry Pi running **moOde 10.x (Trixie, 64-bit)**:
 | Pi | Raspberry Pi 3B+ |
 | DAC | Raspberry Pi DAC+ (PCM5122), with GPIO passthrough header |
 | Screen | Waveshare 2" 240×320 ST7789 IPS, used landscape (320×240). The capacitive-touch version (CST816D) adds touch; the plain one works without it |
-| Controls | Rotary encoder with push switch (EC11-style) |
 | Battery monitor | INA226 module with a 2 mΩ shunt |
 | Power | Mean Well SD-15B-5 (25.6 V pack → 5 V) |
 
@@ -72,33 +71,34 @@ the git history (and `legacy/`); the current UI needs the 320×240 screen.
 
 ## Controls
 
-| | Knob | Touch screen |
-|---|---|---|
-| Volume | Turn | — |
-| Play / pause | Press | Tap |
-| Next track | Press twice | Menu |
-| Change screen | Menu | Swipe left / right |
-| Menu | Hold 1 s | Tap the top bar, or hold a finger down |
-| Close | Hold again | Tap ✕, or tap a popup to dismiss it |
+Everything is on the touch screen (the phone that's playing handles volume too):
+
+| Do this | What happens |
+|---|---|
+| Tap the song on Now playing | A control bar slides up: volume − / +, previous, play/pause, next. It hides after 5 s |
+| Swipe left / right | Change screen |
+| Tap the top bar, or hold a finger down | Menu: disconnect, add a phone, Phones, Join Wi-Fi, Battery, System, Controls help |
+| Tap a popup | Dismiss it |
+| Tap ✕ | Close the menu |
 
 Screens, in swipe order: **Now playing → Battery → Session stats → Phones →
 Join → System.** Info screens go back to Now playing after a minute untouched.
+Disconnecting and forgetting a phone need a second tap to confirm.
 
-In the menu, turn the knob to move and press to choose. Disconnecting and
-forgetting need a second press (or tap) to confirm. On the Phones screen the
-knob picks a phone instead of changing volume; press (or tap a row) for its
-actions.
+An optional rotary knob is still supported (turn = volume, press = play/pause,
+press twice = next, hold = menu): wire it to GPIO 5/6/16 and set
+`KNOB = dict(a=5, b=6, sw=16)` in `display.py`.
 
 For the Join screen to be useful away from home, set up moOde's hotspot
 (Configure → Network) and check once that it comes up when no known Wi-Fi is
 in range.
 
-**Bench control pipe.** Every control can be tested without the knob or touch
-screen fitted:
+**Bench control pipe.** Every control can be tested without the touch screen
+fitted:
 
 ```bash
 cd ~/pirate-audio
-echo press > ctl          # also: double, hold, +, -, left, right, "tap 160 120"
+echo "tap 160 120" > ctl   # also: left, right, hold, press (play/pause), +, -
 ```
 
 ## Files
