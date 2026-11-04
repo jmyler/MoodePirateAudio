@@ -24,6 +24,7 @@ log = logging.getLogger("pirate.sources")
 DB = "file:/var/local/www/db/moode-sqlite3.db?mode=ro"
 WWW = "/var/local/www"
 APLMETA = f"{WWW}/aplmeta.json"
+BTMETA = f"{WWW}/btmeta.json"
 SPOTMETA = f"{WWW}/spotmeta.json"
 
 # active flag -> label (first match wins, in this order)
@@ -83,29 +84,27 @@ def _busctl_json(*args):
 
 
 def bluetooth_info():
-    """(device_name, title, artist, album, playing) for the connected phone, or None."""
-    try:
-        tree = subprocess.run(["busctl", "--system", "--list", "tree", "org.bluez"],
-                              capture_output=True, text=True, timeout=3).stdout.split()
-    except Exception:
-        return None
-    players = [p for p in tree if "/player" in p and p.count("/") == 5]
-    devices = [p for p in tree if p.count("/") == 4 and "/dev_" in p]
-    name = ""
-    for dev in devices:
-        c = _busctl_json("get-property", "org.bluez", dev, "org.bluez.Device1", "Connected")
-        if c and c.get("data"):
-            a = _busctl_json("get-property", "org.bluez", dev, "org.bluez.Device1", "Alias")
-            name = a["data"] if a else dev.rsplit("dev_", 1)[-1].replace("_", ":")
+    """(device_name, title, artist, album, playing) for the connected phone, or None.
+    One D-Bus call (GetManagedObjects via btctl) - no bluetoothctl, so moOde's
+    pairing agent is never disturbed."""
+    import btctl
+    objs = btctl._objects()
+    dev_path, name = None, ""
+    for path, ifaces in objs.items():
+        d = ifaces.get("org.bluez.Device1")
+        if d and d.get("Connected"):
+            dev_path, name = path, d.get("Alias") or d.get("Name") or d.get("Address", "")
             break
-    if not players:
-        return (name, "", "", "", False) if name else None
-    p = players[0]
-    track = _busctl_json("get-property", "org.bluez", p, "org.bluez.MediaPlayer1", "Track") or {}
-    status = _busctl_json("get-property", "org.bluez", p, "org.bluez.MediaPlayer1", "Status") or {}
-    t = {k: v.get("data") for k, v in (track.get("data") or {}).items()}
-    return (name, t.get("Title", "") or "", t.get("Artist", "") or "", t.get("Album", "") or "",
-            status.get("data") == "playing")
+    if not dev_path:
+        return None
+    for path, ifaces in objs.items():
+        p = ifaces.get("org.bluez.MediaPlayer1")
+        if p and path.startswith(dev_path + "/"):
+            t = p.get("Track") or {}
+            t = {k: (v.get("data") if isinstance(v, dict) else v) for k, v in t.items()}
+            return (name, t.get("Title", "") or "", t.get("Artist", "") or "", t.get("Album", "") or "",
+                    p.get("Status") == "playing")
+    return (name, "", "", "", False)
 
 
 class SourceWatcher(threading.Thread):
@@ -148,6 +147,17 @@ class SourceWatcher(threading.Thread):
         if art is not None:       # only remember it once it actually loaded
             self._art_key = path
         self.S.set(art=art)
+
+    def _set_lookup_art(self, artist, title, url=None):
+        """Art from the lookup cache; blank while a download/lookup is in flight."""
+        import artlookup
+        p = artlookup.lookup(artist, title, url) if title else None
+        if p:
+            self._set_art_from_path(p)
+        elif self._art_key is not None and not str(self._art_key).startswith(artlookup.CACHE):
+            self._set_art_from_path(None)       # different track/source: clear the old art
+        elif self._art_key is not None and title and self._art_key != artlookup.path_for(artist, title):
+            self._set_art_from_path(None)
 
     def _mpd_info(self):
         import mpd
@@ -210,11 +220,25 @@ class SourceWatcher(threading.Thread):
             return
 
         if active == "Bluetooth":
-            bt = bluetooth_info()
+            bt = bluetooth_info()                       # phone name (+ AVRCP fallback)
             name, title, artist, album, playing = bt or ("", "", "", "", True)
+            meta, _ = self._json_meta(BTMETA)           # moOde's own Bluetooth metadata
+            url = ""
+            if meta:
+                title = _pick(meta, "title") or title
+                artist = _pick(meta, "artist") or artist
+                album = _pick(meta, "album") or album
+                ps = _pick(meta, "playstate").lower()
+                if ps:
+                    playing = not ps.startswith(("pause", "stop"))
+                url = _pick(meta, "cover_url")
             self.S.set(source="Bluetooth", device=name, playing=playing or not title,
                        title=title, artist=artist, album=album)
-            self._set_art_from_path(None)
+            local = _cover_path(url) if url and not url.startswith("http") else None
+            if local:
+                self._set_art_from_path(local)
+            else:
+                self._set_lookup_art(artist, title, url if url.startswith("http") else None)
             return
 
         if active == "Spotify":
@@ -240,6 +264,9 @@ class SourceWatcher(threading.Thread):
                        album=song.get("album", ""))
             if not radio and song.get("file"):
                 self._mpd_art(song["file"])
+            elif radio and " - " in (song.get("title") or ""):     # stations usually send "Artist - Title"
+                a, t = song["title"].split(" - ", 1)
+                self._set_lookup_art(a, t)
             else:
                 self._set_art_from_path(None)
         else:

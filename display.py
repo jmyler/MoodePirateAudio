@@ -41,8 +41,13 @@ TOAST_S = 4
 
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 FONT_B = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-W = H = 240
-ART = 160
+# Screen: "waveshare2" = Waveshare 2" 240x320 used landscape; "pirate" = Pirate Audio 1.3"
+PANEL = "waveshare2"
+ROTATION = 90             # 90 or 270 - flip if the picture is upside down
+SCREEN_PINS = dict(port=0, cs=1, dc=9, backlight=13, rst=27 if PANEL == "waveshare2" else None)
+W, H = (320, 240) if PANEL == "waveshare2" else (240, 240)
+LANDSCAPE = W > H
+ART = 184 if LANDSCAPE else 160
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("pirate")
@@ -84,6 +89,21 @@ def toast(line1, line2="", color=(70, 140, 255), secs=TOAST_S):
     S.set(toast=(line1, line2, color, time.monotonic() + secs))
 
 
+# ------------------------------------------------------------------ pairing window
+_pair_timer = None
+
+
+def end_pairing():
+    """Close the pairing window now (hidden again; already-paired phones still connect)."""
+    global _pair_timer
+    import btctl
+    if _pair_timer is not None:
+        _pair_timer.cancel()
+        _pair_timer = None
+    btctl.hide()
+    S.set(pairing_until=0.0)
+
+
 # ------------------------------------------------------------------ connection watcher
 class ConnWatcher(threading.Thread):
     """Announce Bluetooth connects/disconnects on screen."""
@@ -104,6 +124,9 @@ class ConnWatcher(threading.Thread):
                         if mac not in self.known:
                             log.info("connected: %s (%s)", name, mac)
                             toast("Connected", name)
+                            if S.pairing_until > time.monotonic():   # someone just paired: close the window
+                                log.info("pairing window closed after %s connected", name)
+                                end_pairing()
                     for mac, name in self.known.items():
                         if mac not in now and name not in self.suppress:
                             log.info("disconnected: %s (%s)", name, mac)
@@ -162,6 +185,26 @@ if os.path.exists(LOGO):
 
 
 SOURCE_ICON = {}   # room for per-source glyphs later
+
+
+def wrap(draw, text, f, width, max_lines):
+    """Word-wrap into at most max_lines; the last line gets an ellipsis if it overflows."""
+    words, lines, cur = (text or "").split(), [], ""
+    for w_ in words:
+        t = (cur + " " + w_).strip()
+        if draw.textlength(t, font=f) <= width:
+            cur = t
+        else:
+            if cur:
+                lines.append(cur)
+            cur = w_
+        if len(lines) == max_lines:
+            break
+    if cur and len(lines) < max_lines:
+        lines.append(cur)
+    if len(lines) == max_lines and " ".join(lines) != " ".join(words):
+        lines[-1] = fit(draw, lines[-1] + " …", f, width)
+    return [fit(draw, ln, f, width) for ln in lines]
 
 
 def fit(draw, text, f, width):
@@ -278,12 +321,36 @@ def _render_main(img, d, src, playing, title, artist, art, b, view, device, inpu
         return img
 
     draw_status(d, b)
+    badge = src if not device else f"{src} · {device}"
+    if LANDSCAPE:
+        # art on the left, track info in a column on the right
+        ax, ay = 8, 32
+        if art is not None:
+            img.paste(art, (ax, ay))
+        else:
+            d.rectangle((ax, ay, ax + ART, ay + ART), outline=(60, 60, 60), width=2)
+            d.text((ax + ART / 2 - 8, ay + ART / 2 - 14), "♪", font=font(28), fill=(90, 90, 90))
+        cx, cw = ax + ART + 10, W - (ax + ART + 10) - 6
+        y = ay
+        for line in wrap(d, title, F_LG, cw, 3):
+            d.text((cx, y), line, font=F_LG, fill="white"); y += 24
+        y += 4
+        for line in wrap(d, artist, F_MD, cw, 2):
+            d.text((cx, y), line, font=F_MD, fill=(180, 180, 180)); y += 21
+        bf = font(12)
+        for i, line in enumerate(wrap(d, badge, bf, cw - 10, 2)):
+            by = ay + ART - 36 + i * 17
+            d.rounded_rectangle((cx, by, cx + d.textlength(line, font=bf) + 10, by + 16), radius=4, fill=(35, 35, 35))
+            d.text((cx + 5, by + 1), line, font=bf, fill=(220, 220, 220))
+        if not playing:
+            d.text((W - 30, ay + ART - 60), "❚❚", font=F_MD, fill=(200, 200, 200))
+        return img
+
     if art is not None:
         img.paste(art, ((W - ART) // 2, 28))
     else:
         d.rectangle(((W - ART) // 2, 28, (W + ART) // 2, 28 + ART), outline=(60, 60, 60), width=2)
         d.text((W / 2 - 8, 28 + ART / 2 - 14), "♪", font=font(28), fill=(90, 90, 90))
-    badge = src if not device else f"{src} · {device}"
     badge = fit(d, badge, font(12), ART - 8)
     bw = d.textlength(badge, font=font(12)) + 10
     bx = (W - ART) // 2 + 4
@@ -334,12 +401,12 @@ def setup_buttons(display):
             toast("Nothing connected", "", (150, 150, 150))
 
     def pairing():
+        global _pair_timer
         if S.pairing_until > time.monotonic():      # long-press again = cancel
-            btctl.hide()
-            S.set(pairing_until=0.0)
+            end_pairing()
             toast("Pairing off", "", (150, 150, 150), 2)
             return
-        btctl.pairing_mode(PAIR_S, on_done=lambda: S.set(pairing_until=0.0))
+        _pair_timer = btctl.pairing_mode(PAIR_S, on_done=lambda: S.set(pairing_until=0.0))
         S.set(bt_name=btctl.alias() or S.bt_name)
         S.set(pairing_until=time.monotonic() + PAIR_S)
 
@@ -382,8 +449,9 @@ def setup_buttons(display):
 # ------------------------------------------------------------------ main
 def main():
     from st7789_lite import ST7789
-    display = ST7789(port=0, cs=1, dc=9, backlight=13, rotation=90,
-                     spi_speed_hz=80 * 1000 * 1000, width=W, height=H)
+    display = ST7789(panel=PANEL, rotation=ROTATION, **SCREEN_PINS)
+    if (display.width, display.height) != (W, H):
+        raise SystemExit(f"ROTATION {ROTATION} gives {display.width}x{display.height}; layout expects {W}x{H}")
     log.info("display up on /dev/gpiochip%d", display.chip_num)
 
     batt = None

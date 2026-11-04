@@ -12,7 +12,6 @@ never leave someone's phone permanently blocked.
 import json
 import logging
 import os
-import re
 import subprocess
 import threading
 import time
@@ -24,23 +23,68 @@ STATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bt_blocks.json
 # moOde's helper for restarting a renderer; drops the current AirPlay sender
 AIRPLAY_RESTART = ["/var/www/util/restart-renderer.php", "--airplay"]
 
-_MAC = re.compile(r"Device ([0-9A-F:]{17}) (.*)")
 _lock = threading.Lock()
 _timers = {}
 
+# All calls go straight to BlueZ over D-Bus (busctl). Never use bluetoothctl here:
+# every bluetoothctl invocation registers itself as the default pairing agent and
+# then exits, which knocks out moOde's agent and makes pairing hang on the phone.
 
-def _ctl(*args, timeout=8):
-    """Run bluetoothctl non-interactively (sudo -n: never prompt)."""
-    r = subprocess.run(["sudo", "-n", "bluetoothctl", *args],
+
+def _busctl(*args, timeout=6):
+    r = subprocess.run(["sudo", "-n", "busctl", "--system", "--json=short", *args],
                        capture_output=True, text=True, timeout=timeout)
     if r.returncode:
-        log.warning("bluetoothctl %s: %s", " ".join(args), (r.stderr or r.stdout).strip()[:200])
-    return r.stdout
+        log.warning("busctl %s: %s", " ".join(args[:4]), (r.stderr or r.stdout).strip()[:200])
+        return None
+    out = r.stdout.strip()
+    return json.loads(out) if out else {}
+
+
+def _objects():
+    """{path: {interface: {prop: value}}} for everything BlueZ manages."""
+    r = _busctl("call", "org.bluez", "/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects")
+    if not r:
+        return {}
+    data = r["data"][0] if isinstance(r.get("data"), list) else r.get("data", {})
+    return {path: {iface: {k: v.get("data") for k, v in props.items()} for iface, props in ifaces.items()}
+            for path, ifaces in data.items()}
+
+
+def adapter_path(objs=None):
+    objs = objs if objs is not None else _objects()
+    for path, ifaces in objs.items():
+        if "org.bluez.Adapter1" in ifaces:
+            return path
+    return "/org/bluez/hci0"
+
+
+def _dev_path(mac, objs=None):
+    objs = objs if objs is not None else _objects()
+    for path, ifaces in objs.items():
+        d = ifaces.get("org.bluez.Device1")
+        if d and d.get("Address", "").upper() == mac.upper():
+            return path
+    return f"{adapter_path(objs)}/dev_{mac.upper().replace(':', '_')}"
+
+
+def _set_adapter(prop, sig, value):
+    _busctl("set-property", "org.bluez", adapter_path(), "org.bluez.Adapter1", prop, sig, value)
 
 
 def connected():
-    out = _ctl("devices", "Connected")
-    return [(m.group(1), m.group(2).strip()) for m in _MAC.finditer(out)]
+    """[(mac, name)] of connected Bluetooth devices."""
+    out = []
+    for path, ifaces in _objects().items():
+        d = ifaces.get("org.bluez.Device1")
+        if d and d.get("Connected"):
+            out.append((d.get("Address", ""), d.get("Alias") or d.get("Name") or d.get("Address", "")))
+    return out
+
+
+def _block(mac, on):
+    _busctl("set-property", "org.bluez", _dev_path(mac), "org.bluez.Device1", "Blocked", "b",
+            "true" if on else "false")
 
 
 def _load():
@@ -59,7 +103,7 @@ def _save(d):
 
 
 def _unblock(mac):
-    _ctl("unblock", mac)
+    _block(mac, False)
     with _lock:
         d = _load()
         d.pop(mac, None)
@@ -78,8 +122,8 @@ def kick():
     """Disconnect + temporarily block the connected phone(s). Returns names kicked."""
     names = []
     for mac, name in connected():
-        _ctl("disconnect", mac)
-        _ctl("block", mac)
+        _busctl("call", "org.bluez", _dev_path(mac), "org.bluez.Device1", "Disconnect")
+        _block(mac, True)
         with _lock:
             d = _load()
             d[mac] = {"name": name, "until": time.time() + HOLD_S}
@@ -102,12 +146,13 @@ def kick_airplay():
 
 
 def hide():
-    _ctl("discoverable", "off")
+    _set_adapter("Discoverable", "b", "false")
 
 
 def pairing_mode(seconds, on_done=None):
-    _ctl("pairable", "on")
-    _ctl("discoverable", "on")
+    _set_adapter("Pairable", "b", "true")
+    _set_adapter("DiscoverableTimeout", "u", "0")
+    _set_adapter("Discoverable", "b", "true")
 
     def end():
         hide()
@@ -121,5 +166,6 @@ def pairing_mode(seconds, on_done=None):
 
 def alias():
     """The name phones see for this speaker (adapter alias)."""
-    m = re.search(r"Alias:\s*(.+)", _ctl("show"))
-    return m.group(1).strip() if m else ""
+    objs = _objects()
+    a = objs.get(adapter_path(objs), {}).get("org.bluez.Adapter1", {})
+    return a.get("Alias") or a.get("Name") or ""

@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 battery_state.json*
 bt_blocks.json*
+art_cache/
