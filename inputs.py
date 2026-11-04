@@ -37,6 +37,7 @@ class Inputs:
     def _dispatch(self):
         while True:
             ev = self.q.get()
+            log.info("input: %s", " ".join(str(x) for x in ev))
             try:
                 self.handler(ev)
             except Exception:
