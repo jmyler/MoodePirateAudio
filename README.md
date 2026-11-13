@@ -160,6 +160,28 @@ The user that Imager creates has passwordless sudo by default; check with
 While testing on the bench, keep the service from grabbing the screen pins
 with `sudo systemctl disable --now pirate-audio`.
 
+## Power button
+
+A Pololu Big Pushbutton Power Switch (HP) sits between the battery monitor and
+the amp/5 V supply, with an illuminated momentary button on the case:
+
+- **Press while off:** the box turns on (button wired from the Pololu's **A**
+  pin to ground). The button's light runs off the switched 5 V, so it's lit
+  exactly while the box is on.
+- **Hold for 2 s while on:** the screen shows a "Power off" ring, the Pi shuts
+  down cleanly, and `dtoverlay=gpio-poweroff,gpiopin=26` pulses the Pololu's
+  **OFF** input at the very end, cutting all power. The Pi reads the button on
+  GPIO 23 through a 1N4148 diode (striped end toward the button), which keeps
+  the A pin's voltage off the Pi.
+- **Auto-off** after 30 minutes with nothing connected, playing or charging
+  (with a 60-second countdown you can tap away), and a clean power-off when the
+  battery is nearly empty instead of letting the BMS cut it.
+- `setup.sh` adds the `gpio-poweroff` line and turns on the Pi's hardware
+  watchdog, so a frozen Pi reboots itself.
+- The charge port connects after the INA226 but before the switch, so the box
+  charges while off. On the next power-up the gauge trusts the voltage if it
+  clearly shows more charge than the saved count.
+
 ## Configuration
 
 Settings are at the top of `display.py`:
@@ -174,6 +196,7 @@ Settings are at the top of `display.py`:
 - `PAIR_S`: how long "Add a phone" stays open
 - `BRIGHT_DIM`, `DIM_PAUSED_S`, `DIM_IDLE_S`, `OFF_IDLE_S`
 - `HOT_C`: CPU temperature warning
+- `POWER_BUTTON`, `POWER_HOLD_S`, `AUTO_OFF_MIN`, `CRITICAL_CELL_V`: power button and auto-off
 - `btctl.HOLD_S`: how long a disconnected phone stays blocked
 
 ## Wiring
