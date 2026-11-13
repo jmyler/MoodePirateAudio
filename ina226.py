@@ -82,6 +82,7 @@ class BatteryGauge:
         self._last = None
         self._full_since = self._empty_since = None
         self._rest_since = None
+        self._boot_checked = False
         self._last_save = 0
         self._load()
 
@@ -113,6 +114,13 @@ class BatteryGauge:
             return
         if self.remaining is None:  # first reading: rough guess from voltage
             self.remaining = soc_from_voltage(v / self.cells) * self.cap
+        elif not self._boot_checked and abs(i) < 1.0:
+            # The box can charge while switched off (Pi asleep, nothing counting). If the voltage
+            # clearly shows more charge than the saved count, trust the voltage.
+            guess = soc_from_voltage(v / self.cells) * self.cap
+            if guess - self.remaining > 0.2 * self.cap:
+                self.remaining = guess
+        self._boot_checked = True
         if not self.synced:
             # Until a full charge gives us a real 100%, re-guess from voltage whenever the
             # pack is resting and the count has drifted far from what the voltage says.
