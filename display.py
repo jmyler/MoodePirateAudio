@@ -71,6 +71,14 @@ POPUP_S = 4
 VOL_SHOW_S = 1.6
 MENU_TIMEOUT_S = 15
 HOT_C = 75                 # CPU temperature warning
+
+# Power button + Pololu soft-latching power switch (see the wiring page). The button turns the
+# box on through the Pololu board; while running, holding it powers off cleanly, and the Pi's
+# last act (dtoverlay=gpio-poweroff,gpiopin=26) cuts the power.
+POWER_BUTTON = 23          # GPIO the button is read on (through the diode); None = not fitted
+POWER_HOLD_S = 2.0         # hold this long to power off, so a bump in the bag can't do it
+AUTO_OFF_MIN = 30          # power off after this long with nothing connected or playing; None = never
+CRITICAL_CELL_V = 2.95     # below this per cell (held 20 s, not charging) power off before the BMS cuts
 HIST_BUCKET_S = 30         # session graph: one point per 30 s ...
 HIST_POINTS = 480          # ... for the last 4 hours
 VIEW_TIMEOUT_S = 60        # info screens go back to now playing after this long untouched
@@ -121,6 +129,8 @@ class State:
         self.join = {}                 # Wi-Fi / moOde details for the QR codes
         self.stats = {}                # session stats
         self.controls_until = 0.0      # touch control bar on Now playing
+        self.power_hold = 0.0          # when the power button went down (0 = not held)
+        self.shutting_down = False
         self.vol_level = 0
 
     def set(self, **kw):
@@ -141,6 +151,22 @@ class State:
 
 S = State()
 VIEWS = ("now", "battery", "stats", "phones", "join", "system")
+
+
+def power_off(reason):
+    """Clean shutdown. With the Pololu switch fitted, the gpio-poweroff overlay cuts the power at the end."""
+    if S.shutting_down:
+        return
+    log.info("powering off: %s", reason)
+    S.set(shutting_down=True, menu=None, help=False, popup=None)
+    S.poke()
+
+    def go():
+        time.sleep(1.5)                          # let the "Powering off" screen draw
+        if not _run(["sudo", "-n", "systemctl", "poweroff"], timeout=10):
+            log.error("poweroff failed (needs passwordless sudo)")
+            S.set(shutting_down=False)
+    threading.Thread(target=go, daemon=True).start()
 
 
 def popup(icon, color, small, big, note="", secs=POPUP_S, **kw):
@@ -369,6 +395,7 @@ class BatteryThread(threading.Thread):
         self.peak = 0.0
         self.alerted = set()
         self.was_charging = False
+        self._crit_since = None
         # session stats (since this program started, i.e. since power-on in normal use)
         self.t0 = time.monotonic()
         self.used_ah = 0.0
@@ -386,6 +413,15 @@ class BatteryThread(threading.Thread):
                 left = ui.fmt_dur(self.g.hours_left)
                 popup("battery", ui.RED if th <= 10 else ui.AMBER, "Battery low",
                       f"{round(pct)}%" + (f" · ~{left}" if left else ""), "Plug in the charger", secs=8)
+        v = getattr(self.g, "v", 0.0)
+        if not charging and 2.5 * CELLS < v < CRITICAL_CELL_V * CELLS:
+            self._crit_since = self._crit_since or time.monotonic()
+            if time.monotonic() - self._crit_since > 20 and not S.shutting_down:
+                popup("battery", ui.RED, "Battery empty", "Powering off", "Charge before next use", secs=10)
+                threading.Timer(8, power_off, args=("battery empty",)).start()
+                self._crit_since = time.monotonic() + 3600      # don't repeat
+        else:
+            self._crit_since = None
         if self.was_charging and not charging and pct >= 99:
             popup("bolt", ui.GREEN, "Battery", "Fully charged")
         self.was_charging = charging
@@ -731,6 +767,10 @@ def snapshot(with_menu=True):
                  phone_sel=min(S.phone_sel, max(0, len(S.phones) - 1)), phone_focus=S.phone_focus or S.touch,
                  join=S.join, stats=S.stats, now_wall=time.time(),
                  knob=any(v is not None for v in KNOB.values()))
+        if S.power_hold:
+            m["power_hold"] = min(1.0, (now - S.power_hold) / POWER_HOLD_S)
+        if S.shutting_down:
+            m.update(splash_kind="off", splash_title=S.bt_name or "Speaker", splash_sub="Powering off…")
         if S.controls_until > now:
             m["controls"] = dict(playing=S.playing, volume=S.vol_level, cap=VOL_MAX)
         if S.popup and S.popup[1] > now:
@@ -764,7 +804,7 @@ def snapshot(with_menu=True):
 def target_brightness(m):
     idle_for = time.monotonic() - S.activity
     if (m.get("popup") or m.get("menu") or m.get("help") or m.get("volume") or m.get("pairing_left")
-            or m.get("controls")):
+            or m.get("controls") or m.get("power_hold") is not None or m.get("splash_kind")):
         return BRIGHT_FULL
     if idle_for < 10 or (m["source"] and m["playing"]):
         return BRIGHT_FULL
@@ -777,6 +817,8 @@ def target_brightness(m):
 
 def animating(m):
     """Screens with motion get redrawn on a timer."""
+    if m.get("power_hold") is not None:
+        return 0.1
     if m.get("pairing_left") or m.get("popup") or m.get("volume") or m.get("controls"):
         return 0.5
     if m["view"] == "battery" and (m["batt"] or {}).get("charging"):
@@ -871,6 +913,21 @@ def main():
         except Exception as e:
             (log.info if TOUCH == "auto" else log.error)("no touch controller: %s", e)
     inp.add_fifo(CTL_FIFO)
+    if POWER_BUTTON is not None:
+        try:
+            from gpiozero import Button
+            pb = Button(POWER_BUTTON, pull_up=True, bounce_time=0.05, hold_time=POWER_HOLD_S, pin_factory=factory)
+
+            def pressed():
+                S.set(power_hold=time.monotonic())
+                S.poke()
+            pb.when_pressed = pressed
+            pb.when_released = lambda: S.set(power_hold=0.0)
+            pb.when_held = lambda: power_off("power button")
+            inp._keep.append(pb)
+            log.info("power button on GPIO %d (hold %.0f s to power off)", POWER_BUTTON, POWER_HOLD_S)
+        except Exception as e:
+            log.warning("power button disabled: %s", e)
 
     # ---- wait briefly for moOde before leaving the splash
     while not S.ready and time.monotonic() - boot_t < 20:
@@ -894,6 +951,19 @@ def main():
         if key != last_key:
             last_key = key
             S.activity = time.monotonic()
+        # auto power-off when nothing has happened for a long time
+        if AUTO_OFF_MIN and not S.shutting_down:
+            idle = (not m["source"] and not (CONN.known or {}) and not (m["batt"] or {}).get("charging")
+                    and not m.get("pairing_left"))
+            idle_for = time.monotonic() - S.activity if idle else 0
+            left = AUTO_OFF_MIN * 60 - idle_for
+            if idle and left <= 0:
+                power_off("idle")
+            elif idle and left <= 60:
+                # set directly: popup() would count as activity and cancel the countdown
+                S.set(popup=(dict(icon="power", color=(255, 255, 255), icon_alpha=40, small="Nothing playing",
+                                  big=f"Off in {int(left)} s", note="Tap or connect to stay on"),
+                             time.monotonic() + 2))
         # backlight
         want = target_brightness(m)
         if want != SCREEN["bright"]:

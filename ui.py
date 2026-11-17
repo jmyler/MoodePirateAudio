@@ -949,6 +949,16 @@ def ov_controls(im, c):
     return im
 
 
+def ov_power_hold(im, frac):
+    im = dim(im, 0.45)
+    d = frosted(im, (70, 50, 250, 190), r=20)
+    ring(d, (160, 104), 30, 5, frac, WHITE, track=(255, 255, 255, 40))
+    power_glyph(d, 160, 104, 20, WHITE)
+    d.text(s(160, 156), "Power off", font=F("Bold", 15, True), fill=WHITE, anchor="mm")
+    d.text(s(160, 175), "Keep holding…", font=F("Medium", 10), fill=T2, anchor="mm")
+    return im
+
+
 # ---------------------------------------------------------------- entry point
 def render(m):
     """m: snapshot dict from display.py. Returns a 320x240 RGB image."""
@@ -986,6 +996,8 @@ def render(m):
             im = ov_menu(im, m["menu"])
         if m.get("help"):
             im = ov_help(im, m.get("touch"), m.get("knob"))
+        if m.get("power_hold") is not None:
+            im = ov_power_hold(im, m["power_hold"])
     out = im.resize((W, H), Image.Resampling.LANCZOS)
     if not (m.get("menu") or m.get("help") or m.get("popup")):
         for img, xy in pastes:
