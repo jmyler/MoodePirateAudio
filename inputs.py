@@ -5,7 +5,7 @@
     ("double",)              knob double press
     ("hold",)                knob held HOLD_S
     ("tap", x, y)            touch tap, logical 320x240 coords
-    ("swipe", "left"|"right"|"up"|"down")
+    ("swipe", "left"|"right"|"up"|"down", x0, y0)   where the finger started
     ("touch_hold", x, y)     finger held still
 
 Sources: a rotary encoder with push switch (gpiozero), the CST816D touch
@@ -13,7 +13,7 @@ controller on the Waveshare 2" touch module (cst816.py), and a bench control
 pipe so every feature can be tested with no hardware at all:
 
     echo press > ctl          echo turn +1 > ctl       echo hold > ctl
-    echo left > ctl           echo tap 100 120 > ctl   echo double > ctl
+    echo left > ctl           echo tap 100 120 > ctl   echo swipe down > ctl
 """
 import logging
 import os
@@ -134,9 +134,9 @@ class Inputs:
                         pass
                     elif max(abs(dx), abs(dy)) >= swipe_px:
                         if abs(dx) >= abs(dy):
-                            self.emit("swipe", "left" if dx < 0 else "right")
+                            self.emit("swipe", "left" if dx < 0 else "right", x0, y0)
                         else:
-                            self.emit("swipe", "up" if dy < 0 else "down")
+                            self.emit("swipe", "up" if dy < 0 else "down", x0, y0)
                     else:
                         self.emit("tap", x0, y0)
                 time.sleep(0.02 if down else 0.03)
@@ -185,9 +185,10 @@ def _parse(line):
     if c in ("press", "double", "hold"):
         return (c,)
     if c in ("left", "right"):
-        return ("swipe", c)
-    if c == "swipe" and len(w) > 1:
-        return ("swipe", w[1])
+        return ("swipe", c, 160, 120)
+    if c == "swipe" and len(w) > 1:            # "swipe down" = from the top edge, like the real gesture
+        y0 = 5 if w[1] == "down" else 120
+        return ("swipe", w[1], int(w[2]) if len(w) > 3 else 160, int(w[3]) if len(w) > 3 else y0)
     if c in ("tap", "touch_hold") and len(w) == 3:
         return (c, int(w[1]), int(w[2]))
     return None

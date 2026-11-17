@@ -358,6 +358,7 @@ def status(d, m):
     else:
         label, x = m.get("bt_name") or "Speaker", 14
     d.text(s(x, 16), fit(d, label, F("SemiBold", 11), 228 - x), font=F("SemiBold", 11), fill=T2, anchor="lm")
+    d.rounded_rectangle(s(148, 3, 172, 6), 2 * SS, fill=(255, 255, 255, 70))   # pull-down handle for the menu
     b = m.get("batt")
     if b:
         soc = b["soc"]
@@ -879,7 +880,7 @@ def ov_help(im, touch, knob=False):
     d.text(s(20, 24), "Controls", font=F("Bold", 15, True), fill=WHITE, anchor="lm")
     d.text(s(300, 24), "tap to close", font=F("Medium", 9), fill=T3, anchor="rm")
     screen = [("Tap the song", "Play, skip and volume buttons"), ("Swipe left / right", "Change screen"),
-              ("Tap the top bar", "Menu: phones, pairing, Wi-Fi"), ("Tap a popup", "Dismiss it")]
+              ("Swipe down from the top", "Menu: phones, pairing, Wi-Fi"), ("Tap a popup", "Dismiss it")]
     knobc = [("Turn", "Volume"), ("Press", "Play / pause"), ("Press twice", "Next track"), ("Hold", "Menu")]
     cols = ([("Screen", screen)] if touch or not knob else []) + ([("Knob", knobc)] if knob else [])
     cw = 292 / len(cols)
