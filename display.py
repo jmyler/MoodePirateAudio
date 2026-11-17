@@ -58,6 +58,7 @@ TOUCH_MAP = "rot90" if ROTATION == 90 else "rot270"     # see touch_test.py
 VOL_STEP = 2               # per knob detent
 VOL_TOUCH_STEP = 5         # per tap on the screen's volume buttons
 CONTROLS_S = 5             # touch control bar hides after this long untouched
+ANIMATE_MENU = True        # menu slides in from the top
 SWIPE_MENU_TOP = 80        # a downward swipe that starts above this line (px) opens the menu
 VOL_MAX = 100              # cap, e.g. 85 so a borrowed phone can't run it flat out
 VOL_SH = "/var/www/util/vol.sh"
@@ -792,6 +793,30 @@ def animating(m):
     return None
 
 
+def slide(display, under, sheet, opening, steps=7):
+    """Animate `sheet` sliding down over `under` (or back up). Frames are just pasted from two
+    already-rendered images, so each costs only the SPI transfer (~30 ms on the Pi 3B+)."""
+    from PIL import ImageDraw
+    W, H = ui.W, ui.H
+    for k in range(1, steps + 1):
+        e = 1 - (1 - k / steps) ** 3                       # ease-out
+        shown = e if opening else 1 - e                     # fraction of the sheet on screen
+        edge = int(round(shown * H))
+        if edge >= H:
+            frame = sheet
+        else:
+            frame = under.copy()
+            if edge > 0:
+                frame.paste(sheet.crop((0, H - edge, W, H)), (0, 0))
+                d = ImageDraw.Draw(frame, "RGBA")
+                for i, a in enumerate((90, 55, 30, 12)):    # soft shadow under the sheet's edge
+                    if edge + i < H:
+                        d.line((0, edge + i, W, edge + i), fill=(0, 0, 0, a))
+        display.display(frame)
+    if not opening:
+        display.display(under)
+
+
 def save_splash(name):
     try:
         img = ui.render(dict(splash_kind="boot", splash_title=name, splash_sub="Starting up…", t=0.3))
@@ -886,6 +911,7 @@ def main():
     S.poke()
     last_refresh = time.monotonic()
     last_key = None
+    last_img, last_menu = None, False
     while True:
         m = snapshot()
         # expire transient UI
@@ -914,7 +940,14 @@ def main():
                 log.warning("screen refresh: %s", e)
         if want > 0:
             t0 = time.monotonic()
-            display.display(ui.render(snapshot()))
+            img = ui.render(snapshot())
+            menu_now = bool(S.menu)
+            if ANIMATE_MENU and last_img is not None and menu_now != last_menu:
+                # menu slides down from the top like a pull-down shade (and back up when it closes)
+                slide(display, last_img if menu_now else img, img if menu_now else last_img, opening=menu_now)
+            else:
+                display.display(img)
+            last_img, last_menu = img, menu_now
             log.debug("frame %.0f ms", (time.monotonic() - t0) * 1000)
         S.dirty.clear()
         S.dirty.wait(timeout=animating(m) or 5)
