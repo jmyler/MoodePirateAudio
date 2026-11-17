@@ -77,7 +77,7 @@ Everything is on the touch screen (the phone that's playing handles volume too):
 |---|---|
 | Tap the song on Now playing | A control bar slides up: volume − / +, previous, play/pause, next. It hides after 5 s |
 | Swipe left / right | Change screen |
-| Tap the top bar, or hold a finger down | Menu: disconnect, add a phone, Phones, Join Wi-Fi, Battery, System, Controls help |
+| Swipe down from the top (or tap the top bar, or hold a finger down) | Menu: disconnect, add a phone, Phones, Join Wi-Fi, Battery, System, Controls help. Swipe up to close |
 | Tap a popup | Dismiss it |
 | Tap ✕ | Close the menu |
 

@@ -58,6 +58,7 @@ TOUCH_MAP = "rot90" if ROTATION == 90 else "rot270"     # see touch_test.py
 VOL_STEP = 2               # per knob detent
 VOL_TOUCH_STEP = 5         # per tap on the screen's volume buttons
 CONTROLS_S = 5             # touch control bar hides after this long untouched
+SWIPE_MENU_TOP = 80        # a downward swipe that starts above this line (px) opens the menu
 VOL_MAX = 100              # cap, e.g. 85 so a borrowed phone can't run it flat out
 VOL_SH = "/var/www/util/vol.sh"
 
@@ -657,7 +658,7 @@ def handle(ev):
             S.dirty.set()
         elif kind == "press":
             _menu_select(S.menu.get("sel", 0))
-        elif kind in ("hold", "touch_hold"):
+        elif kind in ("hold", "touch_hold") or (kind == "swipe" and ev[1] == "up"):
             S.set(menu=None)
         elif kind == "tap":
             hit = ui.menu_hit(ev[1], ev[2], items)
@@ -687,6 +688,11 @@ def handle(ev):
         next_track()
     elif kind in ("hold", "touch_hold"):
         open_menu()
+    elif kind == "swipe" and ev[1] == "down" and (len(ev) < 4 or ev[3] < SWIPE_MENU_TOP):
+        open_menu()
+    elif kind == "swipe" and ev[1] in ("up", "down") and S.view == "phones" and S.phones:
+        step = 4 if ev[1] == "up" else -4                  # finger up = scroll down the list
+        S.set(phone_sel=max(0, min(len(S.phones) - 1, S.phone_sel + step)))
     elif kind == "swipe" and ev[1] in ("left", "right"):
         i = VIEWS.index(S.view) if S.view in VIEWS else 0
         S.set(view=VIEWS[(i + (1 if ev[1] == "left" else -1)) % len(VIEWS)], phone_focus=False, controls_until=0.0)
