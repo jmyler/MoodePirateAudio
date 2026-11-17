@@ -13,6 +13,13 @@ sudo raspi-config nonint do_i2c 0
 sudo sed -i 's/^dtparam=spi=on/#dtparam=spi=on/' "$CFG"
 grep -q '^dtoverlay=spi0-2cs,no_miso' "$CFG" || echo 'dtoverlay=spi0-2cs,no_miso' | sudo tee -a "$CFG" >/dev/null
 
+# Power switch: on the way down, pulse GPIO 26 into the Pololu switch's OFF input.
+grep -q '^dtoverlay=gpio-poweroff' "$CFG" || echo 'dtoverlay=gpio-poweroff,gpiopin=26' | sudo tee -a "$CFG" >/dev/null
+
+# Hardware watchdog: a frozen Pi reboots itself (the power button can't turn off a hung Pi)
+sudo mkdir -p /etc/systemd/system.conf.d
+printf '[Manager]\nRuntimeWatchdogSec=15s\n' | sudo tee /etc/systemd/system.conf.d/watchdog.conf >/dev/null
+
 sudo apt-get install -y python3-venv python3-gpiozero python3-lgpio python3-numpy \
     python3-spidev i2c-tools fonts-dejavu-core fonts-inter iw python3-qrcode
 rm -rf venv
@@ -29,6 +36,6 @@ sudo systemctl daemon-reload
 sudo systemctl enable pirate-splash
 
 echo
-echo "Done. Reboot once (sudo reboot) so the SPI change takes effect."
+echo "Done. Reboot once (sudo reboot) so the SPI, power-off and watchdog changes take effect."
 echo "Test by hand:   venv/bin/python display.py"
 echo "Run on boot:    sudo systemctl enable --now pirate-audio"
